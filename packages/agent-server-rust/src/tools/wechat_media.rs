@@ -704,26 +704,37 @@ pub fn evaluate_image_candidate(
     }
 
     let mut res = decrypt_and_return(dat_path, image_keys, local_id, candidate_role);
-    if res.data.is_none() {
-        tracing::warn!("[media] decryption failed for candidate: {}", dat_path);
-        return unsupported();
+    // If decryption or conversion produced pending() (e.g. unknown format or failed wxgf)
+    if res.media_type == "pending" || res.data.is_none() {
+        return pending();
     }
 
     if let Some(hd_len) = target_hd_len {
-        let file_len = fs::metadata(dat_path).map(|m| m.len()).unwrap_or(0);
-        // Note: .dat container has ~31 bytes header + ciphertext + padding.
-        // If candidate_role is already "original" (from _h.dat) OR container file_len >= hd_len,
-        // the full HD payload is confirmed present on disk.
-        let is_full_hd = candidate_role == "original" || file_len >= hd_len;
-        if !is_full_hd {
+        // If candidate was already explicitly named _h.dat by WeChat
+        if candidate_role == "original" {
+            res.role = Some("original".into());
+            return res;
+        }
+
+        // If candidate was .dat (standard suffix), but message has hdlength:
+        // Decode base64 to check actual decrypted image payload length
+        let payload_len = res.data.as_ref()
+            .and_then(|b64| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok())
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or(0);
+
+        // If payload is smaller than hd_len, it is only a mid-res preview and the full HD image is not ready!
+        if payload_len < hd_len {
             tracing::info!(
-                "[media] message has hdlength={} but dat file size={} on disk for local_id={}, returning pending",
+                "[media] message has hdlength={} but decrypted image payload is only {} bytes for local_id={}, returning pending",
                 hd_len,
-                file_len,
+                payload_len,
                 local_id
             );
             return pending();
         }
+
+        // Promoted to original because payload satisfies the HD length
         res.role = Some("original".into());
     }
 
@@ -790,7 +801,16 @@ fn decrypt_and_return(
 
     let (format, ext) = detect_image_format(&decrypted);
 
-    // WXGF → convert via ffmpeg, fall back to thumbnail
+    // If format is unknown -> NOT deliverable! Keep retryable (pending)
+    if format == "unknown" {
+        tracing::warn!(
+            "[media] decrypted data for local_id={} has unknown image format, returning pending",
+            local_id
+        );
+        return pending();
+    }
+
+    // WXGF → convert via media-convert wxgf2img, must succeed to be deliverable
     if format == "wxgf" {
         if let Some((converted, cfmt)) = convert_media("wxgf2img", &decrypted) {
             let cext = if cfmt == "jpeg" {
@@ -810,29 +830,13 @@ fn decrypt_and_return(
                 role: Some(effective_role.into()),
                 file_path: None,
             };
-        }
-        // Try _t.dat thumbnail
-        let thumb_path = dat_path.replace(".dat", "_t.dat");
-        if Path::new(&thumb_path).exists() {
-            if let Ok(thumb_dat) = fs::read(&thumb_path) {
-                if let Some(xb2) = resolve_xor_byte(&thumb_path, &thumb_dat, image_keys) {
-                    if let Some(dec) = decrypt_dat(&thumb_dat, &image_keys.aes_key_hex, xb2) {
-                        let (tf, te) = detect_image_format(&dec);
-                        return MediaResult {
-                            media_type: "image".into(),
-                            data: Some(base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD,
-                                &dec,
-                            )),
-                            url: None,
-                            format: tf.into(),
-                            filename: format!("msg_{local_id}.{te}"),
-                            role: Some("thumbnail".into()),
-                            file_path: None,
-                        };
-                    }
-                }
-            }
+        } else {
+            // WXGF conversion failed: keep retryable, DO NOT deliver raw WXGF or fallback to thumbnail
+            tracing::warn!(
+                "[media] wxgf2img conversion failed for local_id={}, returning pending",
+                local_id
+            );
+            return pending();
         }
     }
 
@@ -1453,6 +1457,41 @@ mod tests {
         assert_eq!(res_std.role, Some("standard".into()));
         assert_ne!(res_std.role, Some("original".into()));
         assert!(res_std.data.is_some());
+
+        // Verify decoded bytes and headers (Point 2: prove image is validly decodable)
+        let png_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, res_h.data.as_ref().unwrap()).unwrap();
+        assert_eq!(&png_bytes[..4], &[0x89, 0x50, 0x4E, 0x47]); // valid PNG header
+        assert_eq!(png_bytes.len(), 1132);
+
+        let jpeg_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, res_std.data.as_ref().unwrap()).unwrap();
+        assert_eq!(&jpeg_bytes[..2], &[0xFF, 0xD8]); // valid JPEG header
+        assert_eq!(jpeg_bytes.len(), 1076);
+
+        // Case F: Unknown format must NOT be delivered! Must return pending (Point 1)
+        let unk_path = make_synthetic_dat(
+            &temp_dir,
+            "sample_unk.dat",
+            &[0x12, 0x34, 0x56, 0x78], // unknown non-image bytes
+            dummy_aes_hex,
+            xor_byte,
+            10,
+        );
+        let res_unk = evaluate_image_candidate(unk_path.to_str().unwrap(), "standard", None, &image_keys, 306);
+        assert_eq!(res_unk.media_type, "pending");
+        assert!(res_unk.data.is_none());
+
+        // Case G: WXGF conversion failure must NOT fall through to deliver raw bytes! Must return pending (Point 1)
+        let wxgf_path = make_synthetic_dat(
+            &temp_dir,
+            "sample_wxgf.dat",
+            b"wxgf",
+            dummy_aes_hex,
+            xor_byte,
+            10,
+        );
+        let res_wxgf = evaluate_image_candidate(wxgf_path.to_str().unwrap(), "standard", None, &image_keys, 307);
+        assert_eq!(res_wxgf.media_type, "pending");
+        assert!(res_wxgf.data.is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

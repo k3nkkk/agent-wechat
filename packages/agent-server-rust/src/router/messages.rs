@@ -13,13 +13,13 @@ use crate::execution::run_execution_loop;
 use crate::ia::types::{MediaResult, Message, SendResult, SubscriptionEvent};
 use crate::plans::chat_open::{ChatOpenParams, ChatOpenPlan};
 use crate::plans::send_message::{SendMessageParams, SendMessagePlan};
-use crate::plans::video_download::{VideoDownloadParams, VideoDownloadPlan};
+use crate::plans::video_download::{BubbleKind, VideoDownloadParams, VideoDownloadPlan};
 use crate::sessions::manager::get_session;
 use crate::tools::wechat_db::{find_wechat_pid, list_account_dbs};
 use crate::tools::wechat_keys::{extract_keys_async, get_image_keys, get_stored_keys, store_keys};
 use crate::tools::wechat_media::{
-    get_message_media, image_has_only_thumbnail, lookup_message_raw, video_missing_original,
-    video_play_length,
+    get_message_media, image_has_only_thumbnail, image_missing_original, lookup_message_raw,
+    video_missing_original, video_play_length,
 };
 use crate::tools::wechat_messages;
 
@@ -124,13 +124,23 @@ static MEDIA_DOWNLOAD_TRIGGERS: std::sync::LazyLock<
 
 /// UI action that makes WeChat download a message's media.
 enum MediaDownloadJob {
-    /// Showing the chat downloads the image.
+    /// Showing the chat downloads the chat-size image.
     OpenChat,
-    /// The video bubble has to be clicked.
-    ClickVideo {
-        duration_secs: Option<u32>,
-        is_self: bool,
-    },
+    /// Clicking the bubble downloads the video / original image.
+    ClickBubble { kind: BubbleKind, is_self: bool },
+}
+
+/// Opt-in: also fetch original images (`_h.dat`) by opening them in the
+/// viewer. Off by default because it adds a UI action per image.
+fn image_original_enabled() -> bool {
+    matches!(
+        std::env::var("AGENT_WECHAT_IMAGE_ORIGINAL")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Decide whether to keep waiting for media WeChat has not downloaded yet.
@@ -149,7 +159,11 @@ fn media_download_should_wait(
     if !(0..=MEDIA_DOWNLOAD_RECENT_SECS).contains(&age) {
         return false;
     }
-    let key = format!("{chat_id}:{local_id}");
+    let tag = match &job {
+        MediaDownloadJob::OpenChat => "open",
+        MediaDownloadJob::ClickBubble { .. } => "click",
+    };
+    let key = format!("{chat_id}:{local_id}:{tag}");
     let now = std::time::Instant::now();
     {
         let mut triggers = MEDIA_DOWNLOAD_TRIGGERS.lock().unwrap();
@@ -168,22 +182,20 @@ fn media_download_should_wait(
                 );
                 open_chat_for_media(chat_id).await;
             }
-            MediaDownloadJob::ClickVideo {
-                duration_secs,
-                is_self,
-            } => {
+            MediaDownloadJob::ClickBubble { kind, is_self } => {
                 tracing::info!(
-                    "[media] clicking video in {chat_id} to download local_id={local_id}"
+                    "[media] clicking {kind:?} in {chat_id} to download local_id={local_id}"
                 );
-                click_video_for_media(chat_id, duration_secs, is_self).await;
+                click_bubble_for_media(chat_id, kind, is_self).await;
             }
         }
     });
     true
 }
 
-/// Open the chat and click the video bubble so WeChat downloads the `.mp4`.
-async fn click_video_for_media(chat_id: String, duration_secs: Option<u32>, is_self: bool) {
+/// Open the chat and click the media bubble so WeChat downloads the video or
+/// original image.
+async fn click_bubble_for_media(chat_id: String, kind: BubbleKind, is_self: bool) {
     let Some(session) = get_session("default") else {
         return;
     };
@@ -196,7 +208,7 @@ async fn click_video_for_media(chat_id: String, duration_secs: Option<u32>, is_s
     };
     let params = VideoDownloadParams {
         chat_id: chat_id.clone(),
-        duration_secs,
+        kind,
         is_self,
     };
     let noop_emit = |_: SubscriptionEvent| {};
@@ -210,7 +222,7 @@ async fn click_video_for_media(chat_id: String, duration_secs: Option<u32>, is_s
     .await;
     if !result.success {
         tracing::warn!(
-            "[media] video download click failed for {chat_id}: {}",
+            "[media] media download click failed for {chat_id}: {}",
             result.error.unwrap_or_default()
         );
     }
@@ -421,13 +433,25 @@ pub async fn get_media(
     // is clicked. For recent media missing its original, run that UI action
     // once in the background and report pending for a short window;
     // afterwards fall back to what is on disk rather than waiting forever.
+    // With AGENT_WECHAT_IMAGE_ORIGINAL enabled, images are opened in the
+    // viewer to fetch the original (`_h.dat`) instead of the chat-size copy.
     let download_job = match base_type {
+        3 if image_original_enabled()
+            && image_missing_original(&logged_in_user, &keys, &chat_id, local_id, create_time) =>
+        {
+            Some(MediaDownloadJob::ClickBubble {
+                kind: BubbleKind::Image,
+                is_self: message_is_self(&logged_in_user, &keys, &chat_id, local_id),
+            })
+        }
         3 if image_has_only_thumbnail(&logged_in_user, &keys, &chat_id, local_id, create_time) => {
             Some(MediaDownloadJob::OpenChat)
         }
         43 if video_missing_original(&logged_in_user, &keys, &chat_id, local_id, create_time) => {
-            Some(MediaDownloadJob::ClickVideo {
-                duration_secs: video_play_length(&content),
+            Some(MediaDownloadJob::ClickBubble {
+                kind: BubbleKind::Video {
+                    duration_secs: video_play_length(&content),
+                },
                 is_self: message_is_self(&logged_in_user, &keys, &chat_id, local_id),
             })
         }

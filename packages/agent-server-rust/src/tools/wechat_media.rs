@@ -561,6 +561,21 @@ fn image_dat_variants(
     Some(found)
 }
 
+/// True when an image's original (`_h.dat`) is not on disk yet but the image
+/// is known to WeChat (thumbnail and/or chat-size `.dat` present).
+pub(crate) fn image_missing_original(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    create_time: i64,
+) -> bool {
+    match image_dat_variants(account_dir, keys, chat_id, local_id, create_time) {
+        Some(v) => !v.is_empty() && !v.iter().any(|(s, _)| *s == "_h"),
+        None => false,
+    }
+}
+
 /// True when WeChat has only the thumbnail (`_t.dat`) of an image on disk.
 ///
 /// The Linux client downloads the full image only once the message is shown

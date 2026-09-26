@@ -1,9 +1,10 @@
-//! Make WeChat download a received video.
+//! Make WeChat download a received video or original image.
 //!
 //! The Linux client stores only the cover (`_thumb.jpg`) of a video until the
-//! video bubble is clicked in the chat view. This plan opens the chat, clicks
-//! the matching video bubble so WeChat downloads the `.mp4`, waits, and closes
-//! the player with Escape.
+//! video bubble is clicked, and only the chat-size image (`.dat`) until the
+//! image is opened in the viewer (which downloads the original `_h.dat`).
+//! This plan opens the chat, clicks the matching bubble, waits for the
+//! download, and closes the viewer/player with Escape.
 
 use super::Plan;
 use crate::ia::actions;
@@ -13,10 +14,18 @@ use crate::tools::chat_select::open_chat;
 
 pub struct VideoDownloadPlan;
 
+/// Which kind of bubble to click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BubbleKind {
+    /// Video; its length in seconds (`playlength`) picks the right bubble.
+    Video { duration_secs: Option<u32> },
+    /// Image; the most recent image bubble is clicked.
+    Image,
+}
+
 pub struct VideoDownloadParams {
     pub chat_id: String,
-    /// Video length in seconds (`playlength`), used to pick the right bubble.
-    pub duration_secs: Option<u32>,
+    pub kind: BubbleKind,
     /// Sent by the logged-in account: bubble is on the right, otherwise left.
     pub is_self: bool,
 }
@@ -36,8 +45,9 @@ pub struct VideoDownloadPlanState {
 /// Horizontal offset from the message row edge to the middle of a video
 /// bubble (avatar + margin + half the thumbnail), verified on WeChat 4.1.
 const BUBBLE_EDGE_OFFSET: f64 = 150.0;
-/// Time to let WeChat download the video after the click.
-const DOWNLOAD_WAIT_MS: u64 = 6000;
+/// Time to let WeChat download the video / original image after the click.
+const VIDEO_DOWNLOAD_WAIT_MS: u64 = 6000;
+const IMAGE_DOWNLOAD_WAIT_MS: u64 = 3000;
 const MAX_LOCATE_ATTEMPTS: u8 = 3;
 
 /// Parse a "Video0:04" / "视频 1:05" list-item label into seconds.
@@ -54,17 +64,24 @@ fn label_duration_secs(label: &str) -> Option<u32> {
     Some(hours * 3600 + mins * 60 + secs)
 }
 
-/// Find where to click the most recent video bubble matching `duration_secs`
-/// (or the most recent video bubble if none matches).
-pub(crate) fn find_video_bubble_click(
+/// Find where to click the most recent bubble of `kind` (for videos, the most
+/// recent one matching the duration, else the most recent video).
+pub(crate) fn find_bubble_click(
     a11y: &A11yNode,
-    duration_secs: Option<u32>,
+    kind: BubbleKind,
     is_self: bool,
 ) -> Option<(f64, f64)> {
-    let items = query_selector_all(
-        a11y,
-        r#"list[name="Messages"] > list-item[name=/^\s*(Video|视频)/]"#,
-    );
+    let (selector, duration_secs) = match kind {
+        BubbleKind::Video { duration_secs } => (
+            r#"list[name="Messages"] > list-item[name=/^\s*(Video|视频)/]"#,
+            duration_secs,
+        ),
+        BubbleKind::Image => (
+            r#"list[name="Messages"] > list-item[name=/^\s*(Image|Photo|图片)/]"#,
+            None,
+        ),
+    };
+    let items = query_selector_all(a11y, selector);
     let matching: Vec<&&A11yNode> = match duration_secs {
         Some(d) => items
             .iter()
@@ -149,14 +166,21 @@ impl Plan for VideoDownloadPlan {
                 })
             }
             VideoDownloadPhase::Locating => {
-                match find_video_bubble_click(a11y, params.duration_secs, params.is_self) {
+                match find_bubble_click(a11y, params.kind, params.is_self) {
                     Some((x, y)) => {
-                        tracing::info!("[video_download] clicking video bubble at ({x}, {y})");
+                        let wait_ms = match params.kind {
+                            BubbleKind::Video { .. } => VIDEO_DOWNLOAD_WAIT_MS,
+                            BubbleKind::Image => IMAGE_DOWNLOAD_WAIT_MS,
+                        };
+                        tracing::info!(
+                            "[video_download] clicking {:?} bubble at ({x}, {y})",
+                            params.kind
+                        );
                         plan_state.phase = VideoDownloadPhase::Done;
                         Some(SelectedAction {
                             action: actions::sequence(vec![
                                 actions::click_at(x, y),
-                                actions::wait(DOWNLOAD_WAIT_MS),
+                                actions::wait(wait_ms),
                                 Action::Key {
                                     combo: "Escape".to_string(),
                                 },
@@ -167,7 +191,7 @@ impl Plan for VideoDownloadPlan {
                     None => {
                         plan_state.locate_attempts += 1;
                         if plan_state.locate_attempts >= MAX_LOCATE_ATTEMPTS {
-                            plan_state.error = Some("video bubble not found".to_string());
+                            plan_state.error = Some("media bubble not found".to_string());
                             plan_state.phase = VideoDownloadPhase::Done;
                             return None;
                         }
@@ -231,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_video_bubble_click_matches_duration_and_side() {
+    fn test_find_bubble_click_video_matches_duration_and_side() {
         let tree = messages(vec![
             row("Video0:04\n", 0.0),
             row("Hello", 280.0),
@@ -239,24 +263,65 @@ mod tests {
         ]);
         // Duration picks the 0:04 video even though it is not the last one.
         assert_eq!(
-            find_video_bubble_click(&tree, Some(4), true),
+            find_bubble_click(
+                &tree,
+                BubbleKind::Video {
+                    duration_secs: Some(4)
+                },
+                true
+            ),
             Some((977.0, 135.0))
         );
         // Incoming video: bubble on the left.
         assert_eq!(
-            find_video_bubble_click(&tree, Some(10), false),
+            find_bubble_click(
+                &tree,
+                BubbleKind::Video {
+                    duration_secs: Some(10)
+                },
+                false
+            ),
             Some((573.0, 458.0))
         );
         // Unknown duration: most recent video.
         assert_eq!(
-            find_video_bubble_click(&tree, Some(99), true),
+            find_bubble_click(
+                &tree,
+                BubbleKind::Video {
+                    duration_secs: Some(99)
+                },
+                true
+            ),
             Some((977.0, 458.0))
         );
     }
 
     #[test]
-    fn test_find_video_bubble_click_none_without_video() {
+    fn test_find_bubble_click_none_without_media() {
         let tree = messages(vec![row("Hello", 0.0)]);
-        assert_eq!(find_video_bubble_click(&tree, Some(4), true), None);
+        assert_eq!(
+            find_bubble_click(
+                &tree,
+                BubbleKind::Video {
+                    duration_secs: Some(4)
+                },
+                true
+            ),
+            None
+        );
+        assert_eq!(find_bubble_click(&tree, BubbleKind::Image, true), None);
+    }
+
+    #[test]
+    fn test_find_bubble_click_image_picks_most_recent() {
+        let tree = messages(vec![
+            row("Image", 0.0),
+            row("Video0:04", 280.0),
+            row("Image", 560.0),
+        ]);
+        assert_eq!(
+            find_bubble_click(&tree, BubbleKind::Image, false),
+            Some((573.0, 695.0))
+        );
     }
 }

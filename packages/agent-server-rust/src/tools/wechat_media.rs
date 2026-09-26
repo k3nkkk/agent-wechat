@@ -12,7 +12,7 @@ use std::process::Command;
 /// WeChat .dat file magic bytes: 07 08 56 32 08 07
 const DAT_MAGIC: [u8; 6] = [0x07, 0x08, 0x56, 0x32, 0x08, 0x07];
 
-struct ImageKeys {
+pub struct ImageKeys {
     aes_key_hex: String,
     xor_byte: Option<u8>,
 }
@@ -661,6 +661,75 @@ fn extract_file_hash_from_packed_info(hex_info: &str) -> Option<String> {
     None
 }
 
+pub fn candidate_rank(role: &str) -> u8 {
+    match role {
+        "original" => 3,
+        "standard" => 2,
+        "thumbnail" => 1,
+        _ => 0,
+    }
+}
+
+pub fn select_best_candidate(
+    cand_a: Option<(String, &'static str)>,
+    cand_b: Option<(String, &'static str)>,
+) -> Option<(String, &'static str)> {
+    match (cand_a, cand_b) {
+        (Some(a), Some(b)) => {
+            if candidate_rank(b.1) > candidate_rank(a.1) {
+                Some(b)
+            } else {
+                Some(a)
+            }
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+pub fn evaluate_image_candidate(
+    dat_path: &str,
+    candidate_role: &str,
+    target_hd_len: Option<u64>,
+    image_keys: &ImageKeys,
+    local_id: i64,
+) -> MediaResult {
+    if candidate_role == "thumbnail" {
+        tracing::info!(
+            "[media] candidate is thumbnail for local_id={}, returning pending",
+            local_id
+        );
+        return pending();
+    }
+
+    let mut res = decrypt_and_return(dat_path, image_keys, local_id, candidate_role);
+    if res.data.is_none() {
+        tracing::warn!("[media] decryption failed for candidate: {}", dat_path);
+        return unsupported();
+    }
+
+    if let Some(hd_len) = target_hd_len {
+        let file_len = fs::metadata(dat_path).map(|m| m.len()).unwrap_or(0);
+        // Note: .dat container has ~31 bytes header + ciphertext + padding.
+        // If candidate_role is already "original" (from _h.dat) OR container file_len >= hd_len,
+        // the full HD payload is confirmed present on disk.
+        let is_full_hd = candidate_role == "original" || file_len >= hd_len;
+        if !is_full_hd {
+            tracing::info!(
+                "[media] message has hdlength={} but dat file size={} on disk for local_id={}, returning pending",
+                hd_len,
+                file_len,
+                local_id
+            );
+            return pending();
+        }
+        res.role = Some("original".into());
+    }
+
+    res
+}
+
 fn decrypt_and_return(
     dat_path: &str,
     image_keys: &ImageKeys,
@@ -1035,33 +1104,20 @@ pub fn get_message_media_with_raw(
                     xor_byte,
                 };
 
-                let candidate = find_dat_via_resource_db(account_dir, keys, chat_id, local_id, create_time)
-                    .or_else(|| find_dat_via_hardlink(account_dir, keys, chat_id, &content));
+                let candidate_res = find_dat_via_resource_db(account_dir, keys, chat_id, local_id, create_time);
+                let candidate_hl = find_dat_via_hardlink(account_dir, keys, chat_id, &content);
 
-                if let Some((dat_path, mut file_role)) = candidate {
-                    tracing::info!("[media] found dat candidate: {} (role={}) hd_len={:?}", dat_path, file_role, hd_len);
-                    if file_role == "thumbnail" {
-                        tracing::info!("[media] only thumbnail on disk for local_id={}, returning pending", local_id);
-                        return pending();
-                    }
-                    if let Some(target_hd_len) = hd_len {
-                        let file_len = fs::metadata(&dat_path).map(|m| m.len()).unwrap_or(0);
-                        // A .dat container has ~31 bytes header + ciphertext. If file_len >= target_hd_len
-                        // or filename already carried the "_h" role, the full original is present on disk.
-                        let is_full_hd = file_role == "original" || file_len >= target_hd_len;
-                        if !is_full_hd {
-                            tracing::info!(
-                                "[media] message has hdlength={} but dat file size={} on disk for local_id={}, returning pending",
-                                target_hd_len,
-                                file_len,
-                                local_id
-                            );
-                            return pending();
-                        }
-                        file_role = "original";
-                    }
-                    let res = decrypt_and_return(&dat_path, &image_keys, local_id, file_role);
-                    if res.data.is_some() {
+                let candidate = select_best_candidate(candidate_res, candidate_hl);
+
+                if let Some((dat_path, file_role)) = candidate {
+                    tracing::info!(
+                        "[media] best dat candidate: {} (role={}) hd_len={:?}",
+                        dat_path,
+                        file_role,
+                        hd_len
+                    );
+                    let res = evaluate_image_candidate(&dat_path, file_role, hd_len, &image_keys, local_id);
+                    if res.data.is_some() || res.media_type == "pending" {
                         return res;
                     }
                 }
@@ -1303,4 +1359,102 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_candidate_selection_and_hd_evaluation_e2e() {
+        // 1. Verify candidate ranking and selection (Point 1)
+        // resource_db returning thumbnail must NOT block hardlink from picking an HD or standard candidate
+        let cand_res_thumb = Some(("/path/to/thumb_t.dat".to_string(), "thumbnail"));
+        let cand_hl_hd = Some(("/path/to/image_h.dat".to_string(), "original"));
+        let cand_hl_std = Some(("/path/to/image.dat".to_string(), "standard"));
+
+        let picked_hd = select_best_candidate(cand_res_thumb.clone(), cand_hl_hd.clone());
+        assert_eq!(picked_hd, cand_hl_hd);
+
+        let picked_std = select_best_candidate(cand_res_thumb.clone(), cand_hl_std.clone());
+        assert_eq!(picked_std, cand_hl_std);
+
+        let cand_res_std = Some(("/path/to/res.dat".to_string(), "standard"));
+        let picked_best = select_best_candidate(cand_res_std.clone(), cand_hl_hd.clone());
+        assert_eq!(picked_best, cand_hl_hd);
+
+        // 2. Verify HD evaluation and delivery pipeline (Point 2)
+        let temp_dir = std::env::temp_dir().join(format!("wechat_hd_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let dummy_aes_hex = "0123456789abcdef0123456789abcdef";
+        let xor_byte = 0x5au8;
+        let image_keys = ImageKeys {
+            aes_key_hex: dummy_aes_hex.into(),
+            xor_byte: Some(xor_byte),
+        };
+
+        // Create synthetic standard file (size ~1091 bytes)
+        let std_path = make_synthetic_dat(
+            &temp_dir,
+            "sample_std.dat",
+            &[0xFF, 0xD8, 0xFF, 0xE0],
+            dummy_aes_hex,
+            xor_byte,
+            50,
+        );
+        let std_len = std::fs::metadata(&std_path).unwrap().len();
+        assert!(std_len >= 1000);
+
+        // Create synthetic HD file (size ~1147 bytes)
+        let h_path = make_synthetic_dat(
+            &temp_dir,
+            "sample_h.dat",
+            &[0x89, 0x50, 0x4E, 0x47],
+            dummy_aes_hex,
+            xor_byte,
+            100,
+        );
+
+        // Create synthetic thumbnail file
+        let t_path = make_synthetic_dat(
+            &temp_dir,
+            "sample_t.dat",
+            &[0xFF, 0xD8, 0xFF, 0xE0],
+            dummy_aes_hex,
+            xor_byte,
+            10,
+        );
+
+        // Case A: Thumbnail candidate must return pending (202), never delivered as final
+        let res_t = evaluate_image_candidate(t_path.to_str().unwrap(), "thumbnail", None, &image_keys, 301);
+        assert_eq!(res_t.media_type, "pending");
+        assert!(res_t.data.is_none());
+
+        // Case B: HD required (target_hd_len = 50000), but only mid-res file on disk (size 1091 < 50000)
+        // Must return pending (202), strictly preventing mid-res from being masqueraded as original
+        let res_mid = evaluate_image_candidate(std_path.to_str().unwrap(), "standard", Some(50000), &image_keys, 302);
+        assert_eq!(res_mid.media_type, "pending");
+        assert!(res_mid.data.is_none());
+
+        // Case C: HD required (target_hd_len = 50000), and candidate is _h.dat
+        // Delivers as original
+        let res_h = evaluate_image_candidate(h_path.to_str().unwrap(), "original", Some(50000), &image_keys, 303);
+        assert_eq!(res_h.media_type, "image");
+        assert_eq!(res_h.role, Some("original".into()));
+        assert!(res_h.data.is_some());
+
+        // Case D: HD required (target_hd_len = 1000 <= std_len), candidate is .dat
+        // Promoted to original because file size meets hdlength and decrypted cleanly
+        let res_promoted = evaluate_image_candidate(std_path.to_str().unwrap(), "standard", Some(1000), &image_keys, 304);
+        assert_eq!(res_promoted.media_type, "image");
+        assert_eq!(res_promoted.role, Some("original".into()));
+        assert!(res_promoted.data.is_some());
+
+        // Case E: Standard message (no hdlength, like LID 18), candidate is .dat
+        // Delivers cleanly as standard
+        let res_std = evaluate_image_candidate(std_path.to_str().unwrap(), "standard", None, &image_keys, 305);
+        assert_eq!(res_std.media_type, "image");
+        assert_eq!(res_std.role, Some("standard".into()));
+        assert_ne!(res_std.role, Some("original".into()));
+        assert!(res_std.data.is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
 }

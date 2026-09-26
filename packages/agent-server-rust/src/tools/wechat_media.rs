@@ -370,7 +370,7 @@ fn find_dat_via_hardlink(
     keys: &HashMap<String, String>,
     _chat_id: &str,
     content: &str,
-) -> Option<String> {
+) -> Option<(String, &'static str)> {
     let hardlink_key = match keys.get("hardlink.db") {
         Some(k) => k,
         None => {
@@ -379,8 +379,8 @@ fn find_dat_via_hardlink(
         }
     };
     let image_md5 = match xml_attr(content, "md5") {
-        Some(m) => m,
-        None => {
+        Some(m) if !m.is_empty() => m,
+        _ => {
             tracing::warn!(
                 "[media:hardlink] no md5 attr in content (len={})",
                 content.len()
@@ -395,48 +395,80 @@ fn find_dat_via_hardlink(
         hardlink_key,
         &format!(
             "SELECT file_name, dir1, dir2 FROM image_hardlink_info_v4
-             WHERE md5 = '{image_md5}' LIMIT 2;"
+             WHERE md5 = '{image_md5}' LIMIT 10;"
         ),
     );
-    let row = match file_rows.first() {
-        Some(r) => r,
-        None => {
-            tracing::warn!("[media:hardlink] no hardlink row for md5={}", image_md5);
-            return None;
-        }
-    };
-    let file_name = row.get("file_name")?.as_str()?;
-    let dir1 = row.get("dir1")?.as_i64()?;
-    let dir2 = row.get("dir2")?.as_i64()?;
+    if file_rows.is_empty() {
+        tracing::warn!("[media:hardlink] no hardlink row for md5={}", image_md5);
+        return None;
+    }
 
-    let dir_rows = query_wechat_db(
-        &hardlink_db,
-        hardlink_key,
-        &format!("SELECT rowid, username FROM dir2id WHERE rowid IN ({dir1}, {dir2});"),
-    );
-    let dir_map: HashMap<i64, String> = dir_rows
-        .iter()
-        .filter_map(|r| {
-            let rid = r.get("rowid")?.as_i64()?;
-            let name = r.get("username")?.as_str()?.to_string();
-            Some((rid, name))
-        })
-        .collect();
+    // Try candidates prioritizing _h (original), then standard (.dat), then _t (thumbnail)
+    for target_role in &["original", "standard", "thumbnail"] {
+        for row in &file_rows {
+            let file_name = match row.get("file_name").and_then(|v| v.as_str()) {
+                Some(f) => f,
+                None => continue,
+            };
+            let dir1 = match row.get("dir1").and_then(|v| v.as_i64()) {
+                Some(d) => d,
+                None => continue,
+            };
+            let dir2 = match row.get("dir2").and_then(|v| v.as_i64()) {
+                Some(d) => d,
+                None => continue,
+            };
 
-    let chat_dir = dir_map.get(&dir1)?;
-    let date_dir = dir_map.get(&dir2)?;
+            let dir_rows = query_wechat_db(
+                &hardlink_db,
+                hardlink_key,
+                &format!("SELECT rowid, username FROM dir2id WHERE rowid IN ({dir1}, {dir2});"),
+            );
+            let dir_map: HashMap<i64, String> = dir_rows
+                .iter()
+                .filter_map(|r| {
+                    let rid = r.get("rowid")?.as_i64()?;
+                    let name = r.get("username")?.as_str()?.to_string();
+                    Some((rid, name))
+                })
+                .collect();
 
-    for base in &account_base_paths(account_dir) {
-        let dat_path = Path::new(base)
-            .join("msg/attach")
-            .join(chat_dir)
-            .join(date_dir)
-            .join("Img")
-            .join(file_name);
-        if dat_path.exists() {
-            return Some(dat_path.to_string_lossy().to_string());
+            let chat_dir = match dir_map.get(&dir1) {
+                Some(d) => d,
+                None => continue,
+            };
+            let date_dir = match dir_map.get(&dir2) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let stem = file_name
+                .strip_suffix("_h.dat")
+                .or_else(|| file_name.strip_suffix("_t.dat"))
+                .or_else(|| file_name.strip_suffix(".dat"))
+                .unwrap_or(file_name);
+
+            let candidate_file = match *target_role {
+                "original" => format!("{stem}_h.dat"),
+                "standard" => format!("{stem}.dat"),
+                "thumbnail" => format!("{stem}_t.dat"),
+                _ => continue,
+            };
+
+            for base in &account_base_paths(account_dir) {
+                let dat_path = Path::new(base)
+                    .join("msg/attach")
+                    .join(chat_dir)
+                    .join(date_dir)
+                    .join("Img")
+                    .join(&candidate_file);
+                if dat_path.exists() {
+                    return Some((dat_path.to_string_lossy().to_string(), *target_role));
+                }
+            }
         }
     }
+
     tracing::warn!(
         "[media:hardlink] .dat file not found on disk for md5={}",
         image_md5
@@ -495,7 +527,7 @@ fn find_dat_via_resource_db(
     chat_id: &str,
     local_id: i64,
     create_time: i64,
-) -> Option<String> {
+) -> Option<(String, &'static str)> {
     let file_hash = find_file_hash_via_resource_db(account_dir, keys, chat_id, local_id)?;
 
     // Build path: msg/attach/<md5(chatId)>/<year-month>/Img/<hash>.dat
@@ -504,8 +536,8 @@ fn find_dat_via_resource_db(
     let year_month = dt.format("%Y-%m").to_string();
 
     for base in &account_base_paths(account_dir) {
-        // Try mid-res .dat first, then _t.dat thumbnail
-        for suffix in &["", "_t"] {
+        // Try HD .dat first, then standard .dat, then _t.dat thumbnail
+        for (suffix, role) in &[("_h", "original"), ("", "standard"), ("_t", "thumbnail")] {
             let dat_path = Path::new(base)
                 .join("msg/attach")
                 .join(&chat_hash)
@@ -513,7 +545,7 @@ fn find_dat_via_resource_db(
                 .join("Img")
                 .join(format!("{file_hash}{suffix}.dat"));
             if dat_path.exists() {
-                return Some(dat_path.to_string_lossy().to_string());
+                return Some((dat_path.to_string_lossy().to_string(), *role));
             }
         }
     }
@@ -629,7 +661,18 @@ fn extract_file_hash_from_packed_info(hex_info: &str) -> Option<String> {
     None
 }
 
-fn decrypt_and_return(dat_path: &str, image_keys: &ImageKeys, local_id: i64) -> MediaResult {
+fn decrypt_and_return(
+    dat_path: &str,
+    image_keys: &ImageKeys,
+    local_id: i64,
+    file_role: &str,
+) -> MediaResult {
+    let effective_role = if file_role == "thumbnail" {
+        "thumbnail"
+    } else {
+        "original"
+    };
+
     let dat = match fs::read(dat_path) {
         Ok(d) => d,
         Err(_) => {
@@ -694,7 +737,7 @@ fn decrypt_and_return(dat_path: &str, image_keys: &ImageKeys, local_id: i64) -> 
                 url: None,
                 format: cfmt,
                 filename: format!("msg_{local_id}.{cext}"),
-                role: Some("original".into()),
+                role: Some(effective_role.into()),
                 file_path: None,
             };
         }
@@ -732,7 +775,7 @@ fn decrypt_and_return(dat_path: &str, image_keys: &ImageKeys, local_id: i64) -> 
         url: None,
         format: format.into(),
         filename: format!("msg_{local_id}.{ext}"),
-        role: Some("original".into()),
+        role: Some(effective_role.into()),
         file_path: None,
     }
 }
@@ -958,7 +1001,7 @@ pub fn get_message_media(
             return get_file_attachment(account_dir, &content, create_time, local_id);
         }
         3 => {
-            // Image
+            // base == 3: Image
             tracing::info!(
                 "[media] image msg chat_id={}, local_id={}, create_time={}, content_len={}",
                 chat_id,
@@ -966,13 +1009,6 @@ pub fn get_message_media(
                 create_time,
                 content.len()
             );
-
-            // Try cached thumbnail first
-            if let Some(thumb) = get_image_thumbnail(account_dir, chat_id, local_id, create_time) {
-                tracing::info!("[media] found thumbnail for local_id={}", local_id);
-                return thumb;
-            }
-            tracing::info!("[media] no thumbnail for local_id={}", local_id);
 
             // Try .dat decryption if we have image keys
             if let Some((aes_hex, xor_byte)) = image_keys_raw {
@@ -982,18 +1018,32 @@ pub fn get_message_media(
                 };
 
                 // Primary: look up filename from message_resource.db
-                if let Some(dat_path) =
+                if let Some((dat_path, file_role)) =
                     find_dat_via_resource_db(account_dir, keys, chat_id, local_id, create_time)
                 {
-                    tracing::info!("[media] found dat via resource-db: {}", dat_path);
-                    return decrypt_and_return(&dat_path, &image_keys, local_id);
+                    tracing::info!("[media] found dat via resource-db: {} (role={})", dat_path, file_role);
+                    if file_role == "thumbnail" {
+                        tracing::info!("[media] only thumbnail on disk for local_id={}, returning pending", local_id);
+                        return pending();
+                    }
+                    let res = decrypt_and_return(&dat_path, &image_keys, local_id, file_role);
+                    if res.data.is_some() {
+                        return res;
+                    }
                 }
 
                 // Fallback: try hardlink.db (older images may not be in resource db)
-                if let Some(dat_path) = find_dat_via_hardlink(account_dir, keys, chat_id, &content)
+                if let Some((dat_path, file_role)) = find_dat_via_hardlink(account_dir, keys, chat_id, &content)
                 {
-                    tracing::info!("[media] found dat via hardlink: {}", dat_path);
-                    return decrypt_and_return(&dat_path, &image_keys, local_id);
+                    tracing::info!("[media] found dat via hardlink: {} (role={})", dat_path, file_role);
+                    if file_role == "thumbnail" {
+                        tracing::info!("[media] only thumbnail on disk via hardlink for local_id={}, returning pending", local_id);
+                        return pending();
+                    }
+                    let res = decrypt_and_return(&dat_path, &image_keys, local_id, file_role);
+                    if res.data.is_some() {
+                        return res;
+                    }
                 }
 
                 tracing::warn!(
@@ -1005,16 +1055,8 @@ pub fn get_message_media(
                 tracing::warn!("[media] no image keys available for local_id={}", local_id);
             }
 
-            // Image exists but can't be retrieved
-            MediaResult {
-                media_type: "image".into(),
-                data: None,
-                url: None,
-                format: "jpeg".into(),
-                filename: format!("msg_{local_id}.jpg"),
-                role: None,
-                file_path: None,
-            }
+            // Image exists but full resource can't be retrieved yet (pending download)
+            pending()
         }
         43 => {
             // Video
@@ -1101,5 +1143,21 @@ mod tests {
             file_path: None,
         };
         assert_eq!(orig_res.role, Some("original".to_string()));
+    }
+
+    #[test]
+    fn test_effective_role_logic() {
+        let compute_role = |file_role: &str| -> &str {
+            if file_role == "thumbnail" {
+                "thumbnail"
+            } else {
+                "original"
+            }
+        };
+
+        assert_eq!(compute_role("thumbnail"), "thumbnail");
+        assert_ne!(compute_role("thumbnail"), "original");
+        assert_eq!(compute_role("original"), "original");
+        assert_eq!(compute_role("standard"), "original");
     }
 }

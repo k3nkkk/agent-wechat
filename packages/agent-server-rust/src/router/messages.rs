@@ -172,23 +172,21 @@ pub async fn get_media(
             None => {
                 return if params.raw {
                     let mut resp =
-                        (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
+                        (axum::http::StatusCode::NOT_FOUND, "not_found").into_response();
                     resp.headers_mut().insert(
                         "x-media-status",
-                        axum::http::HeaderValue::from_static("unsupported"),
+                        axum::http::HeaderValue::from_static("not_found"),
                     );
                     resp
                 } else {
-                    Json(MediaResult {
-                        media_type: "unsupported".to_string(),
-                        data: None,
-                        url: None,
-                        format: String::new(),
-                        filename: String::new(),
-                        role: None,
-                        file_path: None,
-                    })
-                    .into_response()
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "error": "MESSAGE_NOT_FOUND"
+                        })),
+                    )
+                        .into_response()
                 };
             }
         };

@@ -703,7 +703,8 @@ pub fn evaluate_image_candidate(
         return pending();
     }
 
-    let mut res = decrypt_and_return(dat_path, image_keys, local_id, candidate_role);
+    let (mut res, raw_format, raw_decrypted_len) =
+        decrypt_and_return_detail(dat_path, image_keys, local_id, candidate_role);
     // If decryption or conversion produced pending() (e.g. unknown format or failed wxgf)
     if res.media_type == "pending" || res.data.is_none() {
         return pending();
@@ -717,11 +718,19 @@ pub fn evaluate_image_candidate(
         }
 
         // If candidate was .dat (standard suffix), but message has hdlength:
-        // Decode base64 to check actual decrypted image payload length
-        let payload_len = res.data.as_ref()
-            .and_then(|b64| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok())
-            .map(|bytes| bytes.len() as u64)
-            .unwrap_or(0);
+        // WXGF transcoding alters payload bytes unpredictably. Without a proven WXGF HD sample,
+        // comparing transcoded bytes to hdlength is unsound; candidate must remain pending until _h.dat arrives.
+        if raw_format == "wxgf" {
+            tracing::info!(
+                "[media] message has hdlength={} but candidate is WXGF format for local_id={}, returning pending (HD_WXGF_UNVERIFIED)",
+                hd_len,
+                local_id
+            );
+            return pending();
+        }
+
+        // For standard formats (JPEG, PNG, etc.), check raw decrypted image payload length against hdlength
+        let payload_len = raw_decrypted_len as u64;
 
         // If payload is smaller than hd_len, it is only a mid-res preview and the full HD image is not ready!
         if payload_len < hd_len {
@@ -747,6 +756,15 @@ fn decrypt_and_return(
     local_id: i64,
     file_role: &str,
 ) -> MediaResult {
+    decrypt_and_return_detail(dat_path, image_keys, local_id, file_role).0
+}
+
+fn decrypt_and_return_detail(
+    dat_path: &str,
+    image_keys: &ImageKeys,
+    local_id: i64,
+    file_role: &str,
+) -> (MediaResult, String, usize) {
     let effective_role = match file_role {
         "original" => "original",
         "standard" => "standard",
@@ -757,48 +775,61 @@ fn decrypt_and_return(
     let dat = match fs::read(dat_path) {
         Ok(d) => d,
         Err(_) => {
-            return MediaResult {
-                media_type: "image".into(),
-                data: None,
-                url: None,
-                format: "jpeg".into(),
-                filename: format!("msg_{local_id}.jpg"),
-                role: None,
-                file_path: None,
-            }
+            return (
+                MediaResult {
+                    media_type: "image".into(),
+                    data: None,
+                    url: None,
+                    format: "jpeg".into(),
+                    filename: format!("msg_{local_id}.jpg"),
+                    role: None,
+                    file_path: None,
+                },
+                "unknown".into(),
+                0,
+            );
         }
     };
 
     let xor_byte = match resolve_xor_byte(dat_path, &dat, image_keys) {
         Some(xb) => xb,
         None => {
-            return MediaResult {
-                media_type: "image".into(),
-                data: None,
-                url: None,
-                format: "jpeg".into(),
-                filename: format!("msg_{local_id}.jpg"),
-                role: None,
-                file_path: None,
-            }
+            return (
+                MediaResult {
+                    media_type: "image".into(),
+                    data: None,
+                    url: None,
+                    format: "jpeg".into(),
+                    filename: format!("msg_{local_id}.jpg"),
+                    role: None,
+                    file_path: None,
+                },
+                "unknown".into(),
+                0,
+            );
         }
     };
 
     let decrypted = match decrypt_dat(&dat, &image_keys.aes_key_hex, xor_byte) {
         Some(d) => d,
         None => {
-            return MediaResult {
-                media_type: "image".into(),
-                data: None,
-                url: None,
-                format: "jpeg".into(),
-                filename: format!("msg_{local_id}.jpg"),
-                role: None,
-                file_path: None,
-            }
+            return (
+                MediaResult {
+                    media_type: "image".into(),
+                    data: None,
+                    url: None,
+                    format: "jpeg".into(),
+                    filename: format!("msg_{local_id}.jpg"),
+                    role: None,
+                    file_path: None,
+                },
+                "unknown".into(),
+                0,
+            );
         }
     };
 
+    let raw_decrypted_len = decrypted.len();
     let (format, ext) = detect_image_format(&decrypted);
 
     // If format is unknown -> NOT deliverable! Keep retryable (pending)
@@ -807,7 +838,7 @@ fn decrypt_and_return(
             "[media] decrypted data for local_id={} has unknown image format, returning pending",
             local_id
         );
-        return pending();
+        return (pending(), "unknown".into(), raw_decrypted_len);
     }
 
     // WXGF → convert via media-convert wxgf2img, must succeed to be deliverable
@@ -818,40 +849,48 @@ fn decrypt_and_return(
             } else {
                 cfmt.clone()
             };
-            return MediaResult {
-                media_type: "image".into(),
-                data: Some(base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &converted,
-                )),
-                url: None,
-                format: cfmt,
-                filename: format!("msg_{local_id}.{cext}"),
-                role: Some(effective_role.into()),
-                file_path: None,
-            };
+            return (
+                MediaResult {
+                    media_type: "image".into(),
+                    data: Some(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &converted,
+                    )),
+                    url: None,
+                    format: cfmt,
+                    filename: format!("msg_{local_id}.{cext}"),
+                    role: Some(effective_role.into()),
+                    file_path: None,
+                },
+                "wxgf".into(),
+                raw_decrypted_len,
+            );
         } else {
             // WXGF conversion failed: keep retryable, DO NOT deliver raw WXGF or fallback to thumbnail
             tracing::warn!(
                 "[media] wxgf2img conversion failed for local_id={}, returning pending",
                 local_id
             );
-            return pending();
+            return (pending(), "wxgf".into(), raw_decrypted_len);
         }
     }
 
-    MediaResult {
-        media_type: "image".into(),
-        data: Some(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &decrypted,
-        )),
-        url: None,
-        format: format.into(),
-        filename: format!("msg_{local_id}.{ext}"),
-        role: Some(effective_role.into()),
-        file_path: None,
-    }
+    (
+        MediaResult {
+            media_type: "image".into(),
+            data: Some(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &decrypted,
+            )),
+            url: None,
+            format: format.into(),
+            filename: format!("msg_{local_id}.{ext}"),
+            role: Some(effective_role.into()),
+            file_path: None,
+        },
+        format.into(),
+        raw_decrypted_len,
+    )
 }
 
 // ── Emoji / Sticker ──────────────────────────────────────────────────────────
@@ -1282,6 +1321,53 @@ mod tests {
         file_path
     }
 
+    const VALID_PNG_1132_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAABkAAAAOCAIAAABVWCAXAAAEM0lEQVR4AQEoBNf7AQoUHgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3OwBYQh8zpgAAAABJRU5ErkJggg==";
+
+    fn make_synthetic_dat_from_payload(
+        temp_dir: &std::path::Path,
+        filename: &str,
+        payload: &[u8],
+        aes_key_hex: &str,
+        xor_byte: u8,
+    ) -> std::path::PathBuf {
+        let enc_chunk_size = std::cmp::min(1024, payload.len());
+        let head = &payload[..enc_chunk_size];
+        let tail = &payload[enc_chunk_size..];
+
+        let aes_key = &aes_key_hex.as_bytes()[..16];
+        let mut child = Command::new("openssl")
+            .args(["enc", "-aes-128-ecb", "-K", &hex_encode(aes_key)])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("openssl required for synthetic fixture generation");
+
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(head).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "openssl enc failed");
+        let ct = output.stdout;
+        assert_eq!(ct.len(), 1040);
+
+        let mut xor_payload = Vec::new();
+        for b in tail {
+            xor_payload.push(b ^ xor_byte);
+        }
+
+        let mut dat = Vec::new();
+        dat.extend_from_slice(&DAT_MAGIC);
+        dat.extend_from_slice(&(enc_chunk_size as u32).to_le_bytes());
+        dat.extend_from_slice(&(xor_payload.len() as u32).to_le_bytes());
+        dat.push(0u8);
+        dat.extend_from_slice(&ct);
+        dat.extend_from_slice(&xor_payload);
+
+        let file_path = temp_dir.join(filename);
+        std::fs::write(&file_path, &dat).unwrap();
+        file_path
+    }
+
     #[test]
     fn test_effective_role_preservation_and_synthetic_samples() {
         let compute_role = |file_role: &str| -> &str {
@@ -1405,14 +1491,19 @@ mod tests {
         let std_len = std::fs::metadata(&std_path).unwrap().len();
         assert!(std_len >= 1000);
 
-        // Create synthetic HD file (size ~1147 bytes)
-        let h_path = make_synthetic_dat(
+        // Create synthetic HD file with valid decodable PNG payload (size 1132 bytes, dimensions 25x14)
+        let valid_png_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            VALID_PNG_1132_B64,
+        ).unwrap();
+        assert_eq!(valid_png_bytes.len(), 1132);
+
+        let h_path = make_synthetic_dat_from_payload(
             &temp_dir,
             "sample_h.dat",
-            &[0x89, 0x50, 0x4E, 0x47],
+            &valid_png_bytes,
             dummy_aes_hex,
             xor_byte,
-            100,
         );
 
         // Create synthetic thumbnail file
@@ -1458,10 +1549,14 @@ mod tests {
         assert_ne!(res_std.role, Some("original".into()));
         assert!(res_std.data.is_some());
 
-        // Verify decoded bytes and headers (Point 2: prove image is validly decodable)
+        // Verify decoded bytes, headers, and actual decodable pixel dimensions
         let png_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, res_h.data.as_ref().unwrap()).unwrap();
         assert_eq!(&png_bytes[..4], &[0x89, 0x50, 0x4E, 0x47]); // valid PNG header
         assert_eq!(png_bytes.len(), 1132);
+        // Verify actual image decodability and pixel dimensions (25x14)
+        let decoded_img = image::load_from_memory(&png_bytes).expect("synthetic PNG must be decodable");
+        use image::GenericImageView;
+        assert_eq!(decoded_img.dimensions(), (25, 14));
 
         let jpeg_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, res_std.data.as_ref().unwrap()).unwrap();
         assert_eq!(&jpeg_bytes[..2], &[0xFF, 0xD8]); // valid JPEG header
@@ -1492,6 +1587,22 @@ mod tests {
         let res_wxgf = evaluate_image_candidate(wxgf_path.to_str().unwrap(), "standard", None, &image_keys, 307);
         assert_eq!(res_wxgf.media_type, "pending");
         assert!(res_wxgf.data.is_none());
+
+        // Case H: WXGF candidate when message specifies target hdlength (Point 1 & Point 2)
+        // WXGF transcoding changes byte length unpredictably; without verified WXGF HD sample,
+        // it cannot be promoted to original and must return pending (HD_WXGF_UNVERIFIED).
+        let wxgf_hd_path = make_synthetic_dat(
+            &temp_dir,
+            "sample_wxgf_hd.dat",
+            b"wxgf",
+            dummy_aes_hex,
+            xor_byte,
+            10,
+        );
+        let res_wxgf_hd = evaluate_image_candidate(wxgf_hd_path.to_str().unwrap(), "standard", Some(50), &image_keys, 308);
+        assert_eq!(res_wxgf_hd.media_type, "pending");
+        assert!(res_wxgf_hd.data.is_none());
+        assert_ne!(res_wxgf_hd.role, Some("original".into()));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

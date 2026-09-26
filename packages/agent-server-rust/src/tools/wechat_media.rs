@@ -579,6 +579,36 @@ pub(crate) fn image_has_only_thumbnail(
     }
 }
 
+/// True when a video's `.mp4` is not on disk yet but its resource entry is
+/// known (WeChat only has the cover until the bubble is clicked).
+pub(crate) fn video_missing_original(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    create_time: i64,
+) -> bool {
+    let Some(dt) = chrono::DateTime::from_timestamp(create_time, 0) else {
+        return false;
+    };
+    let year_month = dt.format("%Y-%m").to_string();
+    let Some(hash) = find_file_hash_via_resource_db(account_dir, keys, chat_id, local_id) else {
+        return false;
+    };
+    !account_base_paths(account_dir).iter().any(|base| {
+        Path::new(base)
+            .join("msg/video")
+            .join(&year_month)
+            .join(format!("{hash}.mp4"))
+            .exists()
+    })
+}
+
+/// Video length in seconds from the message XML (`playlength="4"`).
+pub(crate) fn video_play_length(content: &str) -> Option<u32> {
+    xml_attr(content, "playlength").and_then(|v| v.parse().ok())
+}
+
 /// Get video data: .mp4 if downloaded, otherwise cover .jpg or _thumb.jpg.
 /// Videos are stored unencrypted at msg/video/{YYYY-MM}/{hash}.mp4
 fn get_video_data(

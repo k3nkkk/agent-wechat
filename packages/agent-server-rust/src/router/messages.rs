@@ -117,10 +117,39 @@ const MEDIA_DOWNLOAD_RECENT_SECS: i64 = 24 * 60 * 60;
 /// How long to report pending after triggering a download.
 const MEDIA_DOWNLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// When a download was triggered, keyed by "chat_id:local_id".
+/// After an image job finished, how long to keep waiting for its file.
+/// Non-original images never get an `_h.dat`, so waiting for the full
+/// window would only delay them; the chat-size copy is used instead.
+const IMAGE_DONE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A triggered download: when it started and, once the UI job has run,
+/// when it finished.
+#[derive(Clone, Copy)]
+struct DownloadTrigger {
+    started: std::time::Instant,
+    finished: Option<std::time::Instant>,
+}
+
+/// Triggered downloads, keyed by "chat_id:local_id:job".
 static MEDIA_DOWNLOAD_TRIGGERS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    std::sync::Mutex<std::collections::HashMap<String, DownloadTrigger>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn mark_download_finished(key: &str) {
+    if let Some(t) = MEDIA_DOWNLOAD_TRIGGERS.lock().unwrap().get_mut(key) {
+        t.finished = Some(std::time::Instant::now());
+    }
+}
+
+/// Marks a download job finished when the background task ends, including
+/// on failure or panic.
+struct FinishOnDrop(String);
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        mark_download_finished(&self.0);
+    }
+}
 
 /// UI action that makes WeChat download a message's media.
 enum MediaDownloadJob {
@@ -163,18 +192,39 @@ fn media_download_should_wait(
         MediaDownloadJob::OpenChat => "open",
         MediaDownloadJob::ClickBubble { .. } => "click",
     };
+    // Videos keep downloading after the click, so they wait the full window;
+    // images are on disk right after the UI job, so stop shortly after it.
+    let is_image = !matches!(
+        job,
+        MediaDownloadJob::ClickBubble {
+            kind: BubbleKind::Video { .. },
+            ..
+        }
+    );
     let key = format!("{chat_id}:{local_id}:{tag}");
     let now = std::time::Instant::now();
     {
         let mut triggers = MEDIA_DOWNLOAD_TRIGGERS.lock().unwrap();
-        triggers.retain(|_, t| now.duration_since(*t) < MEDIA_DOWNLOAD_WAIT * 4);
-        if let Some(started) = triggers.get(&key) {
-            return now.duration_since(*started) < MEDIA_DOWNLOAD_WAIT;
+        triggers.retain(|_, t| now.duration_since(t.started) < MEDIA_DOWNLOAD_WAIT * 4);
+        if let Some(t) = triggers.get(&key) {
+            if is_image {
+                if let Some(finished) = t.finished {
+                    return now.duration_since(finished) < IMAGE_DONE_GRACE;
+                }
+            }
+            return now.duration_since(t.started) < MEDIA_DOWNLOAD_WAIT;
         }
-        triggers.insert(key, now);
+        triggers.insert(
+            key.clone(),
+            DownloadTrigger {
+                started: now,
+                finished: None,
+            },
+        );
     }
     let chat_id = chat_id.to_string();
     tokio::spawn(async move {
+        let _finish = FinishOnDrop(key);
         match job {
             MediaDownloadJob::OpenChat => {
                 tracing::info!(
@@ -1132,6 +1182,56 @@ mod tests {
         // Simulate cleanup
         let _ = std::fs::remove_dir_all(&send_dir);
         assert!(!send_dir.exists());
+    }
+
+    #[test]
+    fn test_image_wait_ends_shortly_after_job_finishes() {
+        let now = chrono::Utc::now().timestamp();
+        let t0 = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        {
+            let mut triggers = MEDIA_DOWNLOAD_TRIGGERS.lock().unwrap();
+            // Image click finished 10s ago: stop waiting (no _h.dat coming).
+            triggers.insert(
+                "grace_chat:1:click".to_string(),
+                DownloadTrigger {
+                    started: t0,
+                    finished: Some(std::time::Instant::now() - std::time::Duration::from_secs(10)),
+                },
+            );
+            // Image click still running: keep waiting.
+            triggers.insert(
+                "grace_chat:2:click".to_string(),
+                DownloadTrigger {
+                    started: t0,
+                    finished: None,
+                },
+            );
+            // Video click finished: keep waiting, the file may still download.
+            triggers.insert(
+                "grace_chat:3:click".to_string(),
+                DownloadTrigger {
+                    started: t0,
+                    finished: Some(std::time::Instant::now() - std::time::Duration::from_secs(10)),
+                },
+            );
+        }
+        let image = || MediaDownloadJob::ClickBubble {
+            kind: BubbleKind::Image,
+            is_self: false,
+        };
+        assert!(!media_download_should_wait("grace_chat", 1, now, image()));
+        assert!(media_download_should_wait("grace_chat", 2, now, image()));
+        assert!(media_download_should_wait(
+            "grace_chat",
+            3,
+            now,
+            MediaDownloadJob::ClickBubble {
+                kind: BubbleKind::Video {
+                    duration_secs: None
+                },
+                is_self: false,
+            }
+        ));
     }
 
     #[test]

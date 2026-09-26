@@ -517,6 +517,26 @@ fn find_dat_via_resource_db(
     local_id: i64,
     create_time: i64,
 ) -> Option<String> {
+    let variants = image_dat_variants(account_dir, keys, chat_id, local_id, create_time)?;
+    // Best available: HD (_h.dat), then mid-res (.dat), then thumbnail (_t.dat)
+    for suffix in &["_h", "", "_t"] {
+        if let Some((_, path)) = variants.iter().find(|(s, _)| s == suffix) {
+            return Some(path.clone());
+        }
+    }
+    tracing::warn!("[media:resource-db] image file not on disk yet for local_id={local_id}");
+    None
+}
+
+/// Image `.dat` files present on disk for a message, as (suffix, path) pairs.
+/// Suffixes: "_h" (HD original), "" (mid-res), "_t" (thumbnail).
+fn image_dat_variants(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    create_time: i64,
+) -> Option<Vec<(&'static str, String)>> {
     let file_hash = find_file_hash_via_resource_db(account_dir, keys, chat_id, local_id)?;
 
     // Build path: msg/attach/<md5(chatId)>/<year-month>/Img/<hash>.dat
@@ -524,26 +544,39 @@ fn find_dat_via_resource_db(
     let dt = chrono::DateTime::from_timestamp(create_time, 0)?;
     let year_month = dt.format("%Y-%m").to_string();
 
+    let mut found = Vec::new();
     for base in &account_base_paths(account_dir) {
-        // Try mid-res .dat first, then _t.dat thumbnail
-        for suffix in &["", "_t"] {
+        for suffix in ["_h", "", "_t"] {
             let dat_path = Path::new(base)
                 .join("msg/attach")
                 .join(&chat_hash)
                 .join(&year_month)
                 .join("Img")
                 .join(format!("{file_hash}{suffix}.dat"));
-            if dat_path.exists() {
-                return Some(dat_path.to_string_lossy().to_string());
+            if dat_path.exists() && !found.iter().any(|(s, _)| *s == suffix) {
+                found.push((suffix, dat_path.to_string_lossy().to_string()));
             }
         }
     }
+    Some(found)
+}
 
-    tracing::warn!(
-        "[media:resource-db] file not on disk yet for hash={}",
-        file_hash
-    );
-    None
+/// True when WeChat has only the thumbnail (`_t.dat`) of an image on disk.
+///
+/// The Linux client downloads the full image only once the message is shown
+/// in a chat view; until then only the thumbnail exists and callers would
+/// deliver a tiny image. Callers can open the chat to trigger the download.
+pub(crate) fn image_has_only_thumbnail(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    create_time: i64,
+) -> bool {
+    match image_dat_variants(account_dir, keys, chat_id, local_id, create_time) {
+        Some(v) => !v.is_empty() && v.iter().all(|(s, _)| *s == "_t"),
+        None => false,
+    }
 }
 
 /// Get video data: .mp4 if downloaded, otherwise cover .jpg or _thumb.jpg.
@@ -990,14 +1023,8 @@ pub fn get_message_media(
                 content.len()
             );
 
-            // Try cached thumbnail first
-            if let Some(thumb) = get_image_thumbnail(account_dir, chat_id, local_id, create_time) {
-                tracing::info!("[media] found thumbnail for local_id={}", local_id);
-                return thumb;
-            }
-            tracing::info!("[media] no thumbnail for local_id={}", local_id);
-
-            // Try .dat decryption if we have image keys
+            // Try .dat decryption first (HD / mid-res image when downloaded);
+            // the cached chat thumbnail is only a last resort.
             if let Some((aes_hex, xor_byte)) = image_keys_raw {
                 let image_keys = ImageKeys {
                     aes_key_hex: aes_hex,
@@ -1026,6 +1053,11 @@ pub fn get_message_media(
                 );
             } else {
                 tracing::warn!("[media] no image keys available for local_id={}", local_id);
+            }
+
+            if let Some(thumb) = get_image_thumbnail(account_dir, chat_id, local_id, create_time) {
+                tracing::info!("[media] using cached thumbnail for local_id={}", local_id);
+                return thumb;
             }
 
             // Image exists but can't be retrieved

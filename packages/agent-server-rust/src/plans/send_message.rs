@@ -32,15 +32,27 @@ pub enum SendMessagePhase {
     FallbackVerifyingTarget,
     Focusing,
     Inputting,
+    /// Image/file pasted; wait until it shows up in the composer before
+    /// pressing Return (pasting large media takes a moment).
+    AwaitingPaste,
     Confirming,
     Done,
 }
+
+/// Up to ~3s (200ms each) for pasted media to appear in the composer.
+const MAX_PASTE_WAIT_ATTEMPTS: u32 = 15;
 
 pub struct SendMessagePlanState {
     pub phase: SendMessagePhase,
     pub open_result: Option<OpenChatResult>,
     pub confirm_attempts: u32,
     pub send_action_executed: bool,
+    /// Composer cleared before pasting media (drops leftovers of an earlier
+    /// failed send so they are not sent along with this message).
+    pub composer_cleared: bool,
+    pub paste_wait_attempts: u32,
+    /// Return was pressed a second time while confirming.
+    pub return_retried: bool,
     pub failure_reason: Option<String>,
     pub resolved_target_name: Option<String>,
     pub primary_open_error: Option<String>,
@@ -98,6 +110,9 @@ impl Plan for SendMessagePlan {
             open_result: None,
             confirm_attempts: 0,
             send_action_executed: false,
+            composer_cleared: false,
+            paste_wait_attempts: 0,
+            return_retried: false,
             failure_reason: None,
             resolved_target_name: None,
             primary_open_error: None,
@@ -547,46 +562,58 @@ impl Plan for SendMessagePlan {
                         }
                     };
 
-                    plan_state.send_action_executed = true;
-                    plan_state.phase = SendMessagePhase::Confirming;
+                    let frame = identified
+                        .main_window
+                        .as_ref()
+                        .and_then(|m| m.frame.clone());
+                    let has_media = params.file_path.is_some() || params.image_path.is_some();
+
+                    // Media: clear whatever is left in the composer first, so a
+                    // leftover of an earlier failed send is never sent along.
+                    if has_media && !plan_state.composer_cleared {
+                        plan_state.composer_cleared = true;
+                        return Some(SelectedAction {
+                            action: actions::sequence(vec![
+                                Action::Key {
+                                    combo: "ctrl+a".to_string(),
+                                },
+                                Action::Key {
+                                    combo: "Delete".to_string(),
+                                },
+                                Action::Wait { ms: 100 },
+                            ]),
+                            frame,
+                        });
+                    }
 
                     // File
                     if let Some(fp) = &params.file_path {
+                        plan_state.send_action_executed = true;
                         exec_command("paste-file", &[fp], &ExecOptions::default()).await;
+                        plan_state.phase = SendMessagePhase::AwaitingPaste;
                         return Some(SelectedAction {
-                            action: actions::sequence(vec![
-                                Action::Wait { ms: 100 },
-                                Action::Key {
-                                    combo: "Return".to_string(),
-                                },
-                            ]),
-                            frame: identified
-                                .main_window
-                                .as_ref()
-                                .and_then(|m| m.frame.clone()),
+                            action: actions::wait_short(),
+                            frame,
                         });
                     }
 
                     // Image
                     if let Some(ip) = &params.image_path {
+                        plan_state.send_action_executed = true;
                         let mut args: Vec<&str> = vec![ip];
                         if let Some(mime) = &params.image_mime {
                             args.push(mime);
                         }
                         exec_command("paste-image", &args, &ExecOptions::default()).await;
+                        plan_state.phase = SendMessagePhase::AwaitingPaste;
                         return Some(SelectedAction {
-                            action: actions::sequence(vec![
-                                Action::Wait { ms: 100 },
-                                Action::Key {
-                                    combo: "Return".to_string(),
-                                },
-                            ]),
-                            frame: identified
-                                .main_window
-                                .as_ref()
-                                .and_then(|m| m.frame.clone()),
+                            action: actions::wait_short(),
+                            frame,
                         });
                     }
+
+                    plan_state.send_action_executed = true;
+                    plan_state.phase = SendMessagePhase::Confirming;
 
                     // Text
                     if let Some(msg) = &params.message {
@@ -613,6 +640,40 @@ impl Plan for SendMessagePlan {
 
                     plan_state.failure_reason = Some("no_payload_specified".to_string());
                     return None;
+                }
+
+                SendMessagePhase::AwaitingPaste => {
+                    let (_, send_btn) = match resolve_active_composer(a11y) {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            tracing::warn!("[send] resolve_active_composer while awaiting paste: {}", err);
+                            plan_state.failure_reason = Some(err.to_string());
+                            return None;
+                        }
+                    };
+                    let frame = identified
+                        .main_window
+                        .as_ref()
+                        .and_then(|m| m.frame.clone());
+                    if !node_has_state(send_btn, "DISABLED") {
+                        // The pasted media is in the composer: send it.
+                        plan_state.phase = SendMessagePhase::Confirming;
+                        return Some(SelectedAction {
+                            action: Action::Key {
+                                combo: "Return".to_string(),
+                            },
+                            frame,
+                        });
+                    }
+                    plan_state.paste_wait_attempts += 1;
+                    if plan_state.paste_wait_attempts >= MAX_PASTE_WAIT_ATTEMPTS {
+                        plan_state.failure_reason = Some("paste_not_observed".to_string());
+                        return None;
+                    }
+                    return Some(SelectedAction {
+                        action: actions::wait_short(),
+                        frame,
+                    });
                 }
 
                 SendMessagePhase::Confirming => {
@@ -661,6 +722,24 @@ impl Plan for SendMessagePlan {
                     }
 
                     plan_state.confirm_attempts += 1;
+                    // Still enabled: the content is still in the composer, so
+                    // Return did not send it (e.g. pressed while WeChat was
+                    // still busy). Pressing it once more cannot duplicate:
+                    // after a successful send the composer is empty and the
+                    // button is disabled.
+                    if plan_state.confirm_attempts == 2 && !plan_state.return_retried {
+                        plan_state.return_retried = true;
+                        tracing::info!("[send] send button still enabled; pressing Return again");
+                        return Some(SelectedAction {
+                            action: Action::Key {
+                                combo: "Return".to_string(),
+                            },
+                            frame: identified
+                                .main_window
+                                .as_ref()
+                                .and_then(|m| m.frame.clone()),
+                        });
+                    }
                     if plan_state.confirm_attempts >= 5 {
                         plan_state.failure_reason =
                             Some("confirm_timeout_send_button_still_enabled".to_string());
@@ -710,6 +789,9 @@ mod tests {
         let plan = SendMessagePlan;
         let state = plan.initial_plan_state();
         assert!(!state.send_action_executed);
+        assert!(!state.composer_cleared);
+        assert!(!state.return_retried);
+        assert_eq!(state.paste_wait_attempts, 0);
         assert!(state.failure_reason.is_none());
         assert_eq!(state.confirm_attempts, 0);
         assert!(matches!(state.phase, SendMessagePhase::Opening));
@@ -943,6 +1025,123 @@ mod tests {
             Some("confirm_target_not_verified:target_not_verified")
         );
         assert!(matches!(plan_state.phase, SendMessagePhase::Confirming));
+    }
+
+    /// f4 with the active composer's send button enabled or disabled.
+    fn f4_with_send_button(enabled: bool) -> A11yNode {
+        let raw = include_str!("test_fixtures/f4_live_multi_frame_observed.json");
+        let state = if enabled { "\"ENABLED\"" } else { "\"DISABLED\"" };
+        let patched = raw.replacen("[\"ENABLED\"]", &format!("[{state}]"), 1);
+        serde_json::from_str(&patched).expect("fixture must parse")
+    }
+
+    fn image_params() -> SendMessageParams {
+        SendMessageParams {
+            chat_id: "wxid_testb".to_string(),
+            message: None,
+            image_path: Some("/tmp/x.jpg".to_string()),
+            image_mime: Some("image/jpeg".to_string()),
+            file_path: None,
+        }
+    }
+
+    async fn step(
+        plan_state: &mut SendMessagePlanState,
+        params: &SendMessageParams,
+        a11y: &A11yNode,
+    ) -> Option<SelectedAction> {
+        SendMessagePlan
+            .select_action(
+                &AppState::default(),
+                params,
+                &IdentifiedStates {
+                    main_window: None,
+                    popup: None,
+                    contact_card: None,
+                    settings: None,
+                },
+                plan_state,
+                a11y,
+                "test",
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_awaiting_paste_waits_until_media_is_in_composer() {
+        let mut plan_state = SendMessagePlan.initial_plan_state();
+        plan_state.phase = SendMessagePhase::AwaitingPaste;
+        let params = image_params();
+
+        // Composer still empty: keep waiting, no Return yet.
+        let action = step(&mut plan_state, &params, &f4_with_send_button(false)).await;
+        assert!(matches!(action.map(|a| a.action), Some(Action::Wait { .. })));
+        assert!(matches!(plan_state.phase, SendMessagePhase::AwaitingPaste));
+        assert_eq!(plan_state.paste_wait_attempts, 1);
+
+        // Media landed: press Return and confirm.
+        let action = step(&mut plan_state, &params, &f4_with_send_button(true)).await;
+        assert!(action.map(|a| action_contains_return(&a.action)).unwrap_or(false));
+        assert!(matches!(plan_state.phase, SendMessagePhase::Confirming));
+    }
+
+    #[tokio::test]
+    async fn test_media_send_clears_composer_before_pasting() {
+        let mut plan_state = SendMessagePlan.initial_plan_state();
+        plan_state.phase = SendMessagePhase::Inputting;
+        plan_state.resolved_target_name = Some("testB".to_string());
+        let action = step(&mut plan_state, &image_params(), &f4_with_send_button(true))
+            .await
+            .expect("clear action");
+        assert!(!action_contains_return(&action.action));
+        match action.action {
+            Action::Sequence { actions } => {
+                assert!(matches!(&actions[0], Action::Key { combo } if combo == "ctrl+a"));
+                assert!(matches!(&actions[1], Action::Key { combo } if combo == "Delete"));
+            }
+            other => panic!("unexpected action {other:?}"),
+        }
+        assert!(plan_state.composer_cleared);
+        assert!(!plan_state.send_action_executed);
+        assert!(matches!(plan_state.phase, SendMessagePhase::Inputting));
+    }
+
+    #[tokio::test]
+    async fn test_awaiting_paste_gives_up_without_sending() {
+        let mut plan_state = SendMessagePlan.initial_plan_state();
+        plan_state.phase = SendMessagePhase::AwaitingPaste;
+        let params = image_params();
+        let a11y = f4_with_send_button(false);
+        for _ in 0..(MAX_PASTE_WAIT_ATTEMPTS - 1) {
+            assert!(step(&mut plan_state, &params, &a11y).await.is_some());
+        }
+        assert!(step(&mut plan_state, &params, &a11y).await.is_none());
+        assert_eq!(plan_state.failure_reason.as_deref(), Some("paste_not_observed"));
+    }
+
+    #[tokio::test]
+    async fn test_confirming_presses_return_once_more_when_still_enabled() {
+        let mut plan_state = SendMessagePlan.initial_plan_state();
+        plan_state.phase = SendMessagePhase::Confirming;
+        plan_state.resolved_target_name = Some("testB".to_string());
+        plan_state.send_action_executed = true;
+        let params = image_params();
+        let a11y = f4_with_send_button(true);
+
+        let returns: Vec<bool> = {
+            let mut out = Vec::new();
+            for _ in 0..4 {
+                let action = step(&mut plan_state, &params, &a11y).await.expect("action");
+                out.push(action_contains_return(&action.action));
+            }
+            out
+        };
+        assert_eq!(returns, vec![false, true, false, false]);
+        assert!(step(&mut plan_state, &params, &a11y).await.is_none());
+        assert_eq!(
+            plan_state.failure_reason.as_deref(),
+            Some("confirm_timeout_send_button_still_enabled")
+        );
     }
 
     #[test]

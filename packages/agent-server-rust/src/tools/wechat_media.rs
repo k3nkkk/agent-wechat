@@ -667,10 +667,11 @@ fn decrypt_and_return(
     local_id: i64,
     file_role: &str,
 ) -> MediaResult {
-    let effective_role = if file_role == "thumbnail" {
-        "thumbnail"
-    } else {
-        "original"
+    let effective_role = match file_role {
+        "original" => "original",
+        "standard" => "standard",
+        "thumbnail" => "thumbnail",
+        _ => "unknown",
     };
 
     let dat = match fs::read(dat_path) {
@@ -979,8 +980,20 @@ pub fn get_message_media(
     local_id: i64,
     image_keys_raw: Option<(String, Option<u8>)>,
 ) -> MediaResult {
-    let (local_type, create_time, content) =
-        match lookup_message_raw(account_dir, keys, chat_id, local_id) {
+    get_message_media_with_raw(account_dir, keys, chat_id, local_id, image_keys_raw, None)
+}
+
+pub fn get_message_media_with_raw(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    image_keys_raw: Option<(String, Option<u8>)>,
+    message_raw: Option<(i64, i64, String)>,
+) -> MediaResult {
+    let (local_type, create_time, content) = match message_raw {
+        Some(t) => t,
+        None => match lookup_message_raw(account_dir, keys, chat_id, local_id) {
             Some(t) => t,
             None => {
                 tracing::warn!(
@@ -988,9 +1001,10 @@ pub fn get_message_media(
                     chat_id,
                     local_id
                 );
-                return unsupported();
+                return pending();
             }
-        };
+        },
+    };
 
     let base = (local_type & 0xFFFFFFFF) as i32;
     let sub = (local_type >> 32) as i32;
@@ -1010,6 +1024,10 @@ pub fn get_message_media(
                 content.len()
             );
 
+            let hd_len = xml_attr(&content, "hdlength")
+                .and_then(|h| h.parse::<u64>().ok())
+                .filter(|&len| len > 0);
+
             // Try .dat decryption if we have image keys
             if let Some((aes_hex, xor_byte)) = image_keys_raw {
                 let image_keys = ImageKeys {
@@ -1017,28 +1035,30 @@ pub fn get_message_media(
                     xor_byte,
                 };
 
-                // Primary: look up filename from message_resource.db
-                if let Some((dat_path, file_role)) =
-                    find_dat_via_resource_db(account_dir, keys, chat_id, local_id, create_time)
-                {
-                    tracing::info!("[media] found dat via resource-db: {} (role={})", dat_path, file_role);
+                let candidate = find_dat_via_resource_db(account_dir, keys, chat_id, local_id, create_time)
+                    .or_else(|| find_dat_via_hardlink(account_dir, keys, chat_id, &content));
+
+                if let Some((dat_path, mut file_role)) = candidate {
+                    tracing::info!("[media] found dat candidate: {} (role={}) hd_len={:?}", dat_path, file_role, hd_len);
                     if file_role == "thumbnail" {
                         tracing::info!("[media] only thumbnail on disk for local_id={}, returning pending", local_id);
                         return pending();
                     }
-                    let res = decrypt_and_return(&dat_path, &image_keys, local_id, file_role);
-                    if res.data.is_some() {
-                        return res;
-                    }
-                }
-
-                // Fallback: try hardlink.db (older images may not be in resource db)
-                if let Some((dat_path, file_role)) = find_dat_via_hardlink(account_dir, keys, chat_id, &content)
-                {
-                    tracing::info!("[media] found dat via hardlink: {} (role={})", dat_path, file_role);
-                    if file_role == "thumbnail" {
-                        tracing::info!("[media] only thumbnail on disk via hardlink for local_id={}, returning pending", local_id);
-                        return pending();
+                    if let Some(target_hd_len) = hd_len {
+                        let file_len = fs::metadata(&dat_path).map(|m| m.len()).unwrap_or(0);
+                        // A .dat container has ~31 bytes header + ciphertext. If file_len >= target_hd_len
+                        // or filename already carried the "_h" role, the full original is present on disk.
+                        let is_full_hd = file_role == "original" || file_len >= target_hd_len;
+                        if !is_full_hd {
+                            tracing::info!(
+                                "[media] message has hdlength={} but dat file size={} on disk for local_id={}, returning pending",
+                                target_hd_len,
+                                file_len,
+                                local_id
+                            );
+                            return pending();
+                        }
+                        file_role = "original";
                     }
                     let res = decrypt_and_return(&dat_path, &image_keys, local_id, file_role);
                     if res.data.is_some() {
@@ -1145,19 +1165,142 @@ mod tests {
         assert_eq!(orig_res.role, Some("original".to_string()));
     }
 
+    fn make_synthetic_dat(
+        temp_dir: &std::path::Path,
+        filename: &str,
+        format_tag: &[u8],
+        aes_key_hex: &str,
+        xor_byte: u8,
+        pad_len: usize,
+    ) -> std::path::PathBuf {
+        let mut head = Vec::new();
+        head.extend_from_slice(format_tag);
+        while head.len() < 1024 {
+            head.push((head.len() % 251) as u8);
+        }
+
+        let aes_key = &aes_key_hex.as_bytes()[..16];
+        let mut child = Command::new("openssl")
+            .args(["enc", "-aes-128-ecb", "-K", &hex_encode(aes_key)])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("openssl required for synthetic fixture generation");
+
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(&head).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "openssl enc failed");
+        let ct = output.stdout;
+        assert_eq!(ct.len(), 1040);
+
+        let mut xor_payload = Vec::new();
+        for i in 0..pad_len {
+            xor_payload.push(((i % 256) as u8) ^ xor_byte);
+        }
+        if format_tag.starts_with(&[0xFF, 0xD8]) {
+            xor_payload.push(0xFF ^ xor_byte);
+            xor_payload.push(0xD9 ^ xor_byte);
+        } else if format_tag.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+            let expected = [0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82];
+            for b in expected {
+                xor_payload.push(b ^ xor_byte);
+            }
+        }
+
+        let mut dat = Vec::new();
+        dat.extend_from_slice(&DAT_MAGIC);
+        dat.extend_from_slice(&1024u32.to_le_bytes());
+        dat.extend_from_slice(&(xor_payload.len() as u32).to_le_bytes());
+        dat.push(0u8);
+        dat.extend_from_slice(&ct);
+        dat.extend_from_slice(&xor_payload);
+
+        let file_path = temp_dir.join(filename);
+        std::fs::write(&file_path, &dat).unwrap();
+        file_path
+    }
+
     #[test]
-    fn test_effective_role_logic() {
+    fn test_effective_role_preservation_and_synthetic_samples() {
         let compute_role = |file_role: &str| -> &str {
-            if file_role == "thumbnail" {
-                "thumbnail"
-            } else {
-                "original"
+            match file_role {
+                "original" => "original",
+                "standard" => "standard",
+                "thumbnail" => "thumbnail",
+                _ => "unknown",
             }
         };
 
         assert_eq!(compute_role("thumbnail"), "thumbnail");
-        assert_ne!(compute_role("thumbnail"), "original");
+        assert_eq!(compute_role("standard"), "standard");
         assert_eq!(compute_role("original"), "original");
-        assert_eq!(compute_role("standard"), "original");
+
+        // Use synthetic desensitized fixtures generated on the fly with a synthetic dummy key
+        let temp_dir = std::env::temp_dir().join(format!("wechat_synth_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let dummy_aes_hex = "0123456789abcdef0123456789abcdef";
+        let xor_byte = 0x5au8;
+        let image_keys = ImageKeys {
+            aes_key_hex: dummy_aes_hex.into(),
+            xor_byte: Some(xor_byte),
+        };
+
+        // 1. Synthetic HD original (PNG format, 1147 bytes) -> must decrypt and preserve role "original"
+        let h_path = make_synthetic_dat(
+            &temp_dir,
+            "synthetic_h.dat",
+            &[0x89, 0x50, 0x4E, 0x47],
+            dummy_aes_hex,
+            xor_byte,
+            100,
+        );
+        let res_orig = decrypt_and_return(h_path.to_str().unwrap(), &image_keys, 201, "original");
+        assert_eq!(res_orig.media_type, "image");
+        assert_eq!(res_orig.format, "png");
+        assert_eq!(res_orig.role, Some("original".into()));
+        assert!(res_orig.data.is_some());
+
+        // 2. Synthetic standard image (JPEG format, 1091 bytes, different size & hash) -> must decrypt and preserve role "standard"
+        let std_path = make_synthetic_dat(
+            &temp_dir,
+            "synthetic_std.dat",
+            &[0xFF, 0xD8, 0xFF, 0xE0],
+            dummy_aes_hex,
+            xor_byte,
+            50,
+        );
+        let res_std = decrypt_and_return(std_path.to_str().unwrap(), &image_keys, 202, "standard");
+        assert_eq!(res_std.media_type, "image");
+        assert_eq!(res_std.format, "jpeg");
+        assert_eq!(res_std.role, Some("standard".into()));
+        assert_ne!(res_std.role, Some("original".into()));
+        assert!(res_std.data.is_some());
+
+        // Verify SHA256 / content of synthetic_h and synthetic_std are strictly distinct
+        let h_bytes = std::fs::read(&h_path).unwrap();
+        let std_bytes = std::fs::read(&std_path).unwrap();
+        assert_ne!(h_bytes.len(), std_bytes.len());
+        assert_ne!(h_bytes, std_bytes);
+
+        // 3. Synthetic thumbnail (JPEG format, 1051 bytes) -> role "thumbnail"
+        let t_path = make_synthetic_dat(
+            &temp_dir,
+            "synthetic_t.dat",
+            &[0xFF, 0xD8, 0xFF, 0xE0],
+            dummy_aes_hex,
+            xor_byte,
+            10,
+        );
+        let res_thumb = decrypt_and_return(t_path.to_str().unwrap(), &image_keys, 203, "thumbnail");
+        assert_eq!(res_thumb.media_type, "image");
+        assert_eq!(res_thumb.format, "jpeg");
+        assert_eq!(res_thumb.role, Some("thumbnail".into()));
+        assert_ne!(res_thumb.role, Some("original".into()));
+        assert!(res_thumb.data.is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -15,7 +15,7 @@ use crate::plans::send_message::{SendMessageParams, SendMessagePlan};
 use crate::sessions::manager::get_session;
 use crate::tools::wechat_db::{find_wechat_pid, list_account_dbs};
 use crate::tools::wechat_keys::{extract_keys_async, get_image_keys, get_stored_keys, store_keys};
-use crate::tools::wechat_media::{get_message_media, lookup_message_raw};
+use crate::tools::wechat_media::{get_message_media_with_raw, lookup_message_raw};
 use crate::tools::wechat_messages;
 
 #[derive(Deserialize)]
@@ -115,23 +115,21 @@ pub async fn get_media(
         Some(s) => s,
         None => {
             return if params.raw {
-                let mut resp = (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
+                let mut resp = (axum::http::StatusCode::SERVICE_UNAVAILABLE, "session_not_ready").into_response();
                 resp.headers_mut().insert(
                     "x-media-status",
-                    axum::http::HeaderValue::from_static("unsupported"),
+                    axum::http::HeaderValue::from_static("unavailable"),
                 );
                 resp
             } else {
-                Json(MediaResult {
-                    media_type: "unsupported".to_string(),
-                    data: None,
-                    url: None,
-                    format: String::new(),
-                    filename: String::new(),
-                    role: None,
-                    file_path: None,
-                })
-                .into_response()
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "SESSION_NOT_READY"
+                    })),
+                )
+                    .into_response()
             };
         }
     };
@@ -139,23 +137,21 @@ pub async fn get_media(
         Some(u) => u.clone(),
         None => {
             return if params.raw {
-                let mut resp = (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
+                let mut resp = (axum::http::StatusCode::SERVICE_UNAVAILABLE, "user_not_logged_in").into_response();
                 resp.headers_mut().insert(
                     "x-media-status",
-                    axum::http::HeaderValue::from_static("unsupported"),
+                    axum::http::HeaderValue::from_static("unavailable"),
                 );
                 resp
             } else {
-                Json(MediaResult {
-                    media_type: "unsupported".to_string(),
-                    data: None,
-                    url: None,
-                    format: String::new(),
-                    filename: String::new(),
-                    role: None,
-                    file_path: None,
-                })
-                .into_response()
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "USER_NOT_LOGGED_IN"
+                    })),
+                )
+                    .into_response()
             };
         }
     };
@@ -254,7 +250,7 @@ pub async fn get_media(
         get_image_keys(&db, &session.id, &logged_in_user)
     };
 
-    let media = get_message_media(&logged_in_user, &keys, &chat_id, local_id, image_keys);
+    let media = get_message_media_with_raw(&logged_in_user, &keys, &chat_id, local_id, image_keys, Some((local_type, _create_time, _content)));
 
     if !params.raw {
         return Json(media).into_response();
@@ -279,7 +275,7 @@ pub async fn get_media(
     }
 
     // 1. URL-backed sticker/media:
-    if let Some(ref url) = media.url {
+    if let Some(url) = &media.url {
         let mut resp = axum::response::Response::new(axum::body::Body::empty());
         let headers = resp.headers_mut();
         if let Ok(val) = axum::http::HeaderValue::from_str(url) {

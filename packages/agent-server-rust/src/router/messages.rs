@@ -115,7 +115,11 @@ pub async fn get_media(
         Some(s) => s,
         None => {
             return if params.raw {
-                let mut resp = (axum::http::StatusCode::SERVICE_UNAVAILABLE, "session_not_ready").into_response();
+                let mut resp = (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "session_not_ready",
+                )
+                    .into_response();
                 resp.headers_mut().insert(
                     "x-media-status",
                     axum::http::HeaderValue::from_static("unavailable"),
@@ -137,7 +141,11 @@ pub async fn get_media(
         Some(u) => u.clone(),
         None => {
             return if params.raw {
-                let mut resp = (axum::http::StatusCode::SERVICE_UNAVAILABLE, "user_not_logged_in").into_response();
+                let mut resp = (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "user_not_logged_in",
+                )
+                    .into_response();
                 resp.headers_mut().insert(
                     "x-media-status",
                     axum::http::HeaderValue::from_static("unavailable"),
@@ -167,8 +175,7 @@ pub async fn get_media(
             Some(t) => t,
             None => {
                 return if params.raw {
-                    let mut resp =
-                        (axum::http::StatusCode::NOT_FOUND, "not_found").into_response();
+                    let mut resp = (axum::http::StatusCode::NOT_FOUND, "not_found").into_response();
                     resp.headers_mut().insert(
                         "x-media-status",
                         axum::http::HeaderValue::from_static("not_found"),
@@ -250,7 +257,14 @@ pub async fn get_media(
         get_image_keys(&db, &session.id, &logged_in_user)
     };
 
-    let media = get_message_media_with_raw(&logged_in_user, &keys, &chat_id, local_id, image_keys, Some((local_type, _create_time, _content)));
+    let media = get_message_media_with_raw(
+        &logged_in_user,
+        &keys,
+        &chat_id,
+        local_id,
+        image_keys,
+        Some((local_type, _create_time, _content)),
+    );
 
     if !params.raw {
         return Json(media).into_response();

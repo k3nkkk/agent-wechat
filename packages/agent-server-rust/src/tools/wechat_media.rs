@@ -1147,7 +1147,8 @@ pub fn get_message_media_with_raw(
                     xor_byte,
                 };
 
-                let candidate_res = find_dat_via_resource_db(account_dir, keys, chat_id, local_id, create_time);
+                let candidate_res =
+                    find_dat_via_resource_db(account_dir, keys, chat_id, local_id, create_time);
                 let candidate_hl = find_dat_via_hardlink(account_dir, keys, chat_id, &content);
 
                 let candidate = select_best_candidate(candidate_res, candidate_hl);
@@ -1159,7 +1160,13 @@ pub fn get_message_media_with_raw(
                         file_role,
                         hd_len
                     );
-                    let res = evaluate_image_candidate(&dat_path, file_role, hd_len, &image_keys, local_id);
+                    let res = evaluate_image_candidate(
+                        &dat_path,
+                        file_role,
+                        hd_len,
+                        &image_keys,
+                        local_id,
+                    );
                     if res.data.is_some() || res.media_type == "pending" {
                         return res;
                     }
@@ -1384,7 +1391,8 @@ mod tests {
         assert_eq!(compute_role("original"), "original");
 
         // Use synthetic desensitized fixtures generated on the fly with a synthetic dummy key
-        let temp_dir = std::env::temp_dir().join(format!("wechat_synth_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("wechat_synth_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
         let dummy_aes_hex = "0123456789abcdef0123456789abcdef";
@@ -1495,7 +1503,8 @@ mod tests {
         let valid_png_bytes = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             VALID_PNG_1132_B64,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(valid_png_bytes.len(), 1132);
 
         let h_path = make_synthetic_dat_from_payload(
@@ -1517,48 +1526,87 @@ mod tests {
         );
 
         // Case A: Thumbnail candidate must return pending (202), never delivered as final
-        let res_t = evaluate_image_candidate(t_path.to_str().unwrap(), "thumbnail", None, &image_keys, 301);
+        let res_t = evaluate_image_candidate(
+            t_path.to_str().unwrap(),
+            "thumbnail",
+            None,
+            &image_keys,
+            301,
+        );
         assert_eq!(res_t.media_type, "pending");
         assert!(res_t.data.is_none());
 
         // Case B: HD required (target_hd_len = 50000), but only mid-res file on disk (size 1091 < 50000)
         // Must return pending (202), strictly preventing mid-res from being masqueraded as original
-        let res_mid = evaluate_image_candidate(std_path.to_str().unwrap(), "standard", Some(50000), &image_keys, 302);
+        let res_mid = evaluate_image_candidate(
+            std_path.to_str().unwrap(),
+            "standard",
+            Some(50000),
+            &image_keys,
+            302,
+        );
         assert_eq!(res_mid.media_type, "pending");
         assert!(res_mid.data.is_none());
 
         // Case C: HD required (target_hd_len = 50000), and candidate is _h.dat
         // Delivers as original
-        let res_h = evaluate_image_candidate(h_path.to_str().unwrap(), "original", Some(50000), &image_keys, 303);
+        let res_h = evaluate_image_candidate(
+            h_path.to_str().unwrap(),
+            "original",
+            Some(50000),
+            &image_keys,
+            303,
+        );
         assert_eq!(res_h.media_type, "image");
         assert_eq!(res_h.role, Some("original".into()));
         assert!(res_h.data.is_some());
 
         // Case D: HD required (target_hd_len = 1000 <= std_len), candidate is .dat
         // Promoted to original because file size meets hdlength and decrypted cleanly
-        let res_promoted = evaluate_image_candidate(std_path.to_str().unwrap(), "standard", Some(1000), &image_keys, 304);
+        let res_promoted = evaluate_image_candidate(
+            std_path.to_str().unwrap(),
+            "standard",
+            Some(1000),
+            &image_keys,
+            304,
+        );
         assert_eq!(res_promoted.media_type, "image");
         assert_eq!(res_promoted.role, Some("original".into()));
         assert!(res_promoted.data.is_some());
 
         // Case E: Standard message (no hdlength, like LID 18), candidate is .dat
         // Delivers cleanly as standard
-        let res_std = evaluate_image_candidate(std_path.to_str().unwrap(), "standard", None, &image_keys, 305);
+        let res_std = evaluate_image_candidate(
+            std_path.to_str().unwrap(),
+            "standard",
+            None,
+            &image_keys,
+            305,
+        );
         assert_eq!(res_std.media_type, "image");
         assert_eq!(res_std.role, Some("standard".into()));
         assert_ne!(res_std.role, Some("original".into()));
         assert!(res_std.data.is_some());
 
         // Verify decoded bytes, headers, and actual decodable pixel dimensions
-        let png_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, res_h.data.as_ref().unwrap()).unwrap();
+        let png_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            res_h.data.as_ref().unwrap(),
+        )
+        .unwrap();
         assert_eq!(&png_bytes[..4], &[0x89, 0x50, 0x4E, 0x47]); // valid PNG header
         assert_eq!(png_bytes.len(), 1132);
         // Verify actual image decodability and pixel dimensions (25x14)
-        let decoded_img = image::load_from_memory(&png_bytes).expect("synthetic PNG must be decodable");
+        let decoded_img =
+            image::load_from_memory(&png_bytes).expect("synthetic PNG must be decodable");
         use image::GenericImageView;
         assert_eq!(decoded_img.dimensions(), (25, 14));
 
-        let jpeg_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, res_std.data.as_ref().unwrap()).unwrap();
+        let jpeg_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            res_std.data.as_ref().unwrap(),
+        )
+        .unwrap();
         assert_eq!(&jpeg_bytes[..2], &[0xFF, 0xD8]); // valid JPEG header
         assert_eq!(jpeg_bytes.len(), 1076);
 
@@ -1571,7 +1619,13 @@ mod tests {
             xor_byte,
             10,
         );
-        let res_unk = evaluate_image_candidate(unk_path.to_str().unwrap(), "standard", None, &image_keys, 306);
+        let res_unk = evaluate_image_candidate(
+            unk_path.to_str().unwrap(),
+            "standard",
+            None,
+            &image_keys,
+            306,
+        );
         assert_eq!(res_unk.media_type, "pending");
         assert!(res_unk.data.is_none());
 
@@ -1584,7 +1638,13 @@ mod tests {
             xor_byte,
             10,
         );
-        let res_wxgf = evaluate_image_candidate(wxgf_path.to_str().unwrap(), "standard", None, &image_keys, 307);
+        let res_wxgf = evaluate_image_candidate(
+            wxgf_path.to_str().unwrap(),
+            "standard",
+            None,
+            &image_keys,
+            307,
+        );
         assert_eq!(res_wxgf.media_type, "pending");
         assert!(res_wxgf.data.is_none());
 
@@ -1599,12 +1659,17 @@ mod tests {
             xor_byte,
             10,
         );
-        let res_wxgf_hd = evaluate_image_candidate(wxgf_hd_path.to_str().unwrap(), "standard", Some(50), &image_keys, 308);
+        let res_wxgf_hd = evaluate_image_candidate(
+            wxgf_hd_path.to_str().unwrap(),
+            "standard",
+            Some(50),
+            &image_keys,
+            308,
+        );
         assert_eq!(res_wxgf_hd.media_type, "pending");
         assert!(res_wxgf_hd.data.is_none());
         assert_ne!(res_wxgf_hd.role, Some("original".into()));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
-
 }

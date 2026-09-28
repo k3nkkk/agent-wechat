@@ -1,5 +1,4 @@
-use super::wechat_db::{get_db_path, query_wechat_db};
-use super::wechat_live_db::query_hot_wechat_db;
+use super::wechat_live_db::{query_fresh_db, query_hot_wechat_db};
 use crate::ia::types::Chat;
 use std::collections::HashMap;
 
@@ -19,7 +18,6 @@ pub fn list_chats(
         None => return Ok(Vec::new()),
     };
 
-    let contact_db = get_db_path(account_dir, "contact.db");
 
     let session_sql = format!(
         "SELECT username, type, unread_count, summary, draft, last_timestamp,
@@ -52,9 +50,7 @@ pub fn list_chats(
             .collect::<Vec<_>>()
             .join(",");
 
-        let contacts = query_wechat_db(
-            &contact_db,
-            contact_key,
+        let contacts = query_fresh_db(account_dir, "contact.db", contact_key,
             &format!(
                 "SELECT username, nick_name, remark, alias, small_head_url, local_type
                  FROM contact
@@ -160,14 +156,10 @@ pub fn get_chat_by_username(
     let session_key = keys.get("session.db")?;
     let contact_key = keys.get("contact.db")?;
 
-    let session_db = get_db_path(account_dir, "session.db");
-    let contact_db = get_db_path(account_dir, "contact.db");
 
     let escaped = username.replace('\'', "''");
 
-    let sessions = query_wechat_db(
-        &session_db,
-        session_key,
+    let sessions = query_fresh_db(account_dir, "session.db", session_key,
         &format!(
             "SELECT username, type, unread_count, summary, draft, last_timestamp,
                     sort_timestamp, last_msg_sender, last_sender_display_name, is_hidden,
@@ -180,9 +172,7 @@ pub fn get_chat_by_username(
     let session = sessions.first()?;
     let is_group = username.contains("@chatroom");
 
-    let contacts = query_wechat_db(
-        &contact_db,
-        contact_key,
+    let contacts = query_fresh_db(account_dir, "contact.db", contact_key,
         &format!(
             "SELECT username, nick_name, remark, alias, small_head_url, local_type
              FROM contact
@@ -265,13 +255,9 @@ pub fn find_chats_by_name(
         None => return Vec::new(),
     };
 
-    let contact_db = get_db_path(account_dir, "contact.db");
-    let session_db = get_db_path(account_dir, "session.db");
     let escaped = query.replace('\'', "''");
 
-    let contacts = query_wechat_db(
-        &contact_db,
-        contact_key,
+    let contacts = query_fresh_db(account_dir, "contact.db", contact_key,
         &format!(
             "SELECT username, nick_name, remark, alias, small_head_url, local_type
              FROM contact
@@ -293,9 +279,7 @@ pub fn find_chats_by_name(
         .collect::<Vec<_>>()
         .join(",");
 
-    let sessions = query_wechat_db(
-        &session_db,
-        session_key,
+    let sessions = query_fresh_db(account_dir, "session.db", session_key,
         &format!(
             "SELECT username, type, unread_count, summary, draft, last_timestamp,
                     sort_timestamp, last_msg_sender, last_sender_display_name, is_hidden,

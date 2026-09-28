@@ -1,4 +1,4 @@
-use super::wechat_db::{get_db_path, query_wechat_db};
+use super::wechat_live_db::query_fresh_db;
 use crate::ia::types::Contact;
 use std::collections::HashMap;
 
@@ -51,13 +51,10 @@ pub fn list_contacts(
         None => return Vec::new(),
     };
 
-    let contact_db = get_db_path(account_dir, "contact.db");
 
     // local_type: 0=system notifications, 1=contacts+official, 2=chatrooms, 3=contacts, 5=openim
     // Include 1, 3, 5 (skip 0=system notifications, 2=chatrooms)
-    let rows = query_wechat_db(
-        &contact_db,
-        contact_key,
+    let rows = query_fresh_db(account_dir, "contact.db", contact_key,
         &format!(
             "SELECT username, nick_name, remark, alias, small_head_url, local_type
              FROM contact
@@ -116,12 +113,9 @@ pub fn find_contacts(
         None => return Vec::new(),
     };
 
-    let contact_db = get_db_path(account_dir, "contact.db");
     let escaped = query.replace('\'', "''");
 
-    let rows = query_wechat_db(
-        &contact_db,
-        contact_key,
+    let rows = query_fresh_db(account_dir, "contact.db", contact_key,
         &format!(
             "SELECT username, nick_name, remark, alias, small_head_url, local_type
              FROM contact

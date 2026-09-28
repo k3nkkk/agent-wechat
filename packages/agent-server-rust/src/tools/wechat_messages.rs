@@ -1,5 +1,5 @@
 use super::wechat_db::{get_db_path, query_wechat_db};
-use super::wechat_live_db::query_hot_wechat_db;
+use super::wechat_live_db::{query_fresh_db, query_hot_wechat_db};
 use crate::ia::types::{Message, ReplyInfo};
 use md5::{Digest, Md5};
 use std::collections::HashMap;
@@ -271,15 +271,12 @@ pub fn list_messages(
                 .collect();
 
             if !senders.is_empty() {
-                let contact_db = get_db_path(account_dir, "contact.db");
                 let placeholders = senders
                     .iter()
                     .map(|s| format!("'{}'", s.replace('\'', "''")))
                     .collect::<Vec<_>>()
                     .join(",");
-                let contacts = query_wechat_db(
-                    &contact_db,
-                    contact_key,
+                let contacts = query_fresh_db(account_dir, "contact.db", contact_key,
                     &format!("SELECT username, nick_name, remark FROM contact WHERE username IN ({placeholders});"),
                 );
                 for c in contacts {

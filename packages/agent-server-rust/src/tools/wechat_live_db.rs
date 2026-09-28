@@ -741,3 +741,25 @@ mod tests {
         );
     }
 }
+
+/// Read a WeChat DB including rows still in its WAL (private hot snapshot),
+/// falling back to the main file if the snapshot cannot be refreshed.
+///
+/// `query_wechat_db` opens the main file with `immutable=1`, which ignores the
+/// WAL. WeChat can keep megabytes of changes there for a long time (e.g. the
+/// whole contact list right after a login), so names read that way can be
+/// stale: a contact's remark shown in the UI was missing and message sends
+/// failed their target-name check.
+pub fn query_fresh_db(account_dir: &str, db_name: &str, hex_key: &str, sql: &str) -> Vec<serde_json::Value> {
+    match query_hot_wechat_db(account_dir, db_name, hex_key, sql) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("[db] hot query for {db_name} failed, using main file: {e}");
+            super::wechat_db::query_wechat_db(
+                &super::wechat_db::get_db_path(account_dir, db_name),
+                hex_key,
+                sql,
+            )
+        }
+    }
+}

@@ -22,6 +22,14 @@ if [ "${MIME:-}" = "image/gif" ] || [[ "${FILE,,}" == *.gif ]]; then
   exec /opt/tools/paste-file "$FILE"
 fi
 
+# Paste the image as a file path (text/uri-list) by default: WeChat reads the
+# file itself and still sends it as an image, while streaming the bytes
+# through the clipboard gets slow for large images. Set
+# AGENT_WECHAT_PASTE_IMAGE_AS_BYTES=1 to use the clipboard bytes instead.
+if [ "${AGENT_WECHAT_PASTE_IMAGE_AS_BYTES:-}" != "1" ]; then
+  exec /opt/tools/paste-file "$FILE"
+fi
+
 # A still-running xclip from an earlier paste owns the clipboard with the
 # same MIME type; pasting before the new owner takes over would insert the
 # previous image. Stop it first.

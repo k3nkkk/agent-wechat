@@ -12,12 +12,37 @@ fi
 
 TEXT="$1"
 
-# Copy to clipboard using xclip (backgrounded — xclip blocks until
-# the selection is consumed, so it must run in parallel with the paste)
-echo -n "$TEXT" | xclip -selection clipboard >/dev/null 2>&1 &
-sleep 0.1
+# A still-running xclip from an earlier paste keeps owning the clipboard
+# (e.g. a text/uri-list left behind by paste-file / paste-image). If Ctrl+V
+# lands before the new owner has taken over, WeChat receives that stale
+# content instead of the text -- a file URI whose temp file may already be
+# gone. Stop the old owner first.
+pkill -x xclip >/dev/null 2>&1 || true
 
-# Paste using Ctrl+V (consumes the clipboard, letting xclip exit)
+# Copy to clipboard using xclip (backgrounded -- xclip keeps serving the
+# selection until another owner takes it, so it must run in parallel with
+# the paste)
+printf '%s' "$TEXT" | xclip -selection clipboard -t UTF8_STRING >/dev/null 2>&1 &
+
+# Wait until our xclip owns the clipboard and offers plain text only
+# (up to ~2s), so a previous owner is never pasted instead.
+ready=0
+for _ in $(seq 1 20); do
+  targets="$(xclip -selection clipboard -o -t TARGETS 2>/dev/null || true)"
+  if printf '%s\n' "$targets" | grep -qx "UTF8_STRING" \
+    && ! printf '%s\n' "$targets" | grep -qx "text/uri-list"; then
+    ready=1
+    break
+  fi
+  sleep 0.1
+done
+
+if [ "$ready" != "1" ]; then
+  echo "clipboard not ready; refusing to paste" >&2
+  exit 1
+fi
+
+# Paste using Ctrl+V
 xdotool key ctrl+v
 
 # Small delay after paste
